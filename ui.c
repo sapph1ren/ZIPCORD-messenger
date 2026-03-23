@@ -1,0 +1,28 @@
+/* nuklear - 1.32.0 - public domain */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <limits.h>
+
+#include "nuklear.h"
+#include "nuklear_gdi.h"
+
+
+static void zc_chat() {
+
+	
+}
+
+static void zc_voice() {
+
+	
+}
+
+static void zc_chats() {
+
+
+	
+}
+
