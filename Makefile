@@ -2,7 +2,7 @@ TARGET = Zipcord.exe
 CC = ccache gcc
 
 CFLAGS = -w -Wall -std=c17 -O3 -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -mwindows
-SRC = main.c sqlite3.c
+SRC = main.c sqlite3.c SHA512.c
 OBJS = $(SRC:.c=.o)
 LIBS = -lgdi32 -luser32 -lshell32 -lmsimg32
 all: $(TARGET)

@@ -21,8 +21,8 @@
 #define NK_GDI_IMPLEMENTATION 
 #include "nuklear.h"
 #include "nuklear_gdi.h"      
-#include "main.h"
 #include "sqlite3.h"
+#include <stdbool.h>
 #include <stdint.h>
 //#include "uv.h"
 
@@ -44,29 +44,226 @@ int con_max = 4096;
 struct nk_image my_gui_image;
 #include <string.h>
 
-void bd_init(sqlite3* db){
+typedef struct{
+	int mid;
+	uint8_t cid;
+	uint8_t uid;
+	union {
+		char* text;
+		struct nk_image img;
+		char* did; // 0... - айди для скачивания  C:/ - путь до файла, чтобы открыть и не скачивать
+	} content;
+	uint8_t type;
+	char* time;
+	char* name;
+} MSG;
+
+typedef struct{
+	char* name;
+	uint8_t cid;
+	int lid;
+	struct nk_image ava;
+	char* mmbrs;
+	char* obn;	
+} CHAT;
+
+typedef struct{
+	char* name;
+	uint8_t uid;
+	struct nk_image ava;
+	bool ver;
+	char* obn;	
+} USER;
+
+typedef struct{
+	char* name;
+	uint64_t* hash;
+	struct nk_image ava;
+	uint8_t uid;
+	bool ver;
+	char* obn;	
+} ME;
+
+typedef struct {
+	sqlite3_stmt *save_me;
+    sqlite3_stmt *save_user;
+    sqlite3_stmt *save_chat;
+    sqlite3_stmt *save_msg;
+
+	sqlite3_stmt *get_me;
+    sqlite3_stmt *get_user_by_uid;
+    sqlite3_stmt *get_user_by_name;
+    sqlite3_stmt *get_chat_by_cid;
+    sqlite3_stmt *get_msgs_by_cid;
+
+	sqlite3_stmt *update_me;
+    sqlite3_stmt *update_user;
+    sqlite3_stmt *update_chat;
+    sqlite3_stmt *update_msg;
+
+	sqlite3_stmt *delete_msg_by_mid;
+    sqlite3_stmt *delete_msgs_by_cid;
+	sqlite3_stmt* delete_user_by_uid;	
+} STMTS;
+
+void bd_init(sqlite3* db, STMTS* stmts){
 	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA synchronous = 0;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
-	sqlite3_exec(db, "PRAGMA cache_size = 500;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA ignore_check_constraints = 1;", NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA foreign_keys = OFF;", NULL, NULL, NULL);
-	sqlite3_exec(db, "PRAGMA mmap_size = 0;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA optimize;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA wal_autocheckpoint = 400;", NULL, NULL, NULL);
-	sqlite3_exec(db, "PRAGMA wal_checkpoint(PASSIVE);", NULL, NULL, NULL);
+	// sqlite3_exec(db, "PRAGMA wal_checkpoint(PASSIVE);", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA mmap_size = 134217728;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA page_size = 4096;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA cache_size = 2000;", NULL, NULL, NULL);
 
 
-	sqlite3_exec(db, "CREATE TABLE IF NOT EXIST ME(NAME TEXT, PASSW BLOB, AVA BLOB, UID INTEGER, VER BOOLEAN);")
-	sqlite3_exec(db, "CREATE TABLE IF NOT EXIST USERS(NAME TEXT, UID INTEGER, AVA BLOB, VER BOOLEAN);")
-	sqlite3_exec(db, "CREATE TABLE IF NOT EXIST CHATS(NAME TEXT, AVA BLOB, UID INTEGER, MMBRS TEXT, LID INTEGER);")
-	sqlite3_exec(db, "CREATE TABLE IF NOT EXIST MSGS(MID INTEGER, UID INTEGER, TEXT TEXT, MEDIA BLOB, TYPE INTEGER, TIME TEXT);")
+	sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS ME(NAME TEXT, PASSW BLOB, AVA BLOB, UID INTEGER, VER BOOLEAN, OBN TEXT);", NULL, NULL, NULL);
+	sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS USERS(NAME TEXT, UID INTEGER, AVA BLOB, VER BOOLEAN, OBN TEXT);", NULL, NULL, NULL);
+	sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS CHATS(NAME TEXT, AVA BLOB, CID INTEGER, MMBRS TEXT, LID INTEGER, OBN TEXT);", NULL, NULL, NULL);
+	sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS MSGS(MID INTEGER, UID INTEGER, CID INTEGER, TEXT TEXT, MEDIA BLOB, TYPE INTEGER, TIME TEXT);", NULL, NULL, NULL);
 
+	sqlite3_exec(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uid ON USERS(UID);", NULL, NULL, NULL);
+	sqlite3_exec(db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_cid ON CHATS(CID);", NULL, NULL, NULL);
+
+
+	  // Сохранение ME (с заменой при конфликте)
+    rc = sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO ME (NAME, PASSW, AVA, UID, VER, OBN) "
+        "VALUES (?, ?, ?, ?, ?, ?);",
+        -1, &stmts->save_me, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Сохранение пользователя
+    rc = sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO USERS (NAME, UID, AVA, VER, OBN) "
+        "VALUES (?, ?, ?, ?, ?);",
+        -1, &stmts->save_user, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Сохранение чата
+    rc = sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO CHATS (NAME, AVA, CID, MMBRS, LID, OBN) "
+        "VALUES (?, ?, ?, ?, ?, ?);",
+        -1, &stmts->save_chat, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Сохранение сообщения
+    rc = sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO MSGS (MID, UID, CID, TEXT, MEDIA, TYPE, TIME) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);",
+        -1, &stmts->save_msg, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // === ИЗВЛЕЧЕНИЕ ===
+    
+    // Получить ME (текущего пользователя)
+    rc = sqlite3_prepare_v2(db,
+        "SELECT NAME, PASSW, AVA, UID, VER, OBN FROM ME LIMIT 1;",
+        -1, &stmts->get_me, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Получить пользователя по UID
+    rc = sqlite3_prepare_v2(db,
+        "SELECT NAME, AVA, VER, OBN FROM USERS WHERE UID = ?;",
+        -1, &stmts->get_user_by_uid, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Получить пользователя по имени
+    rc = sqlite3_prepare_v2(db,
+        "SELECT UID, NAME, AVA, VER, OBN FROM USERS WHERE NAME = ?;",
+        -1, &stmts->get_user_by_name, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Получить чат по CID
+    rc = sqlite3_prepare_v2(db,
+        "SELECT NAME, AVA, MMBRS, LID, OBN FROM CHATS WHERE CID = ?;",
+        -1, &stmts->get_chat_by_cid, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Получить сообщения чата (по CID, сортировка по времени)
+    rc = sqlite3_prepare_v2(db,
+        "SELECT MID, UID, TEXT, MEDIA, TYPE, TIME FROM MSGS "
+        "WHERE CID = ? ORDER BY TIME ASC;",
+        -1, &stmts->get_msgs_by_cid, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Получить сообщения чата с пагинацией (LIMIT/OFFSET)
+    rc = sqlite3_prepare_v2(db,
+        "SELECT MID, UID, TEXT, MEDIA, TYPE, TIME FROM MSGS "
+        "WHERE CID = ? ORDER BY TIME ASC LIMIT ? OFFSET ?;",
+        -1, &stmts->get_msgs_by_cid_range, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Получить сообщения пользователя в чате
+    rc = sqlite3_prepare_v2(db,
+        "SELECT MID, TEXT, MEDIA, TYPE, TIME FROM MSGS "
+        "WHERE CID = ? AND UID = ? ORDER BY TIME ASC;",
+        -1, &stmts->get_msgs_by_cid_uid, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // === ОБНОВЛЕНИЕ ===
+    
+    // Обновить OBN для ME
+    rc = sqlite3_prepare_v2(db,
+        "UPDATE ME SET OBN = ? WHERE UID = ?;",
+        -1, &stmts->update_me, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Обновить пользователя
+    rc = sqlite3_prepare_v2(db,
+        "UPDATE USERS SET NAME = ?, AVA = ?, VER = ?, OBN = ? WHERE UID = ?;",
+        -1, &stmts->update_user, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // Обновить чат
+    rc = sqlite3_prepare_v2(db,
+        "UPDATE CHATS SET NAME = ?, AVA = ?, MMBRS = ?, OBN = ? WHERE CID = ?;",
+        -1, &stmts->update_chat, NULL);
+    if (rc != SQLITE_OK) return rc;
+    
+    // === УДАЛЕНИЕ ===
+ 
+    // Удалить все сообщения чата
+    rc = sqlite3_prepare_v2(db,
+        "DELETE * FROM MSGS WHERE CID = ?;",
+        -1, &stmts->delete_msgs_by_cid, NULL);
+    if (rc != SQLITE_OK) return rc;
+	// Удалить 
+    rc = sqlite3_prepare_v2(db,
+        "DELETE * FROM USERS WHERE UID = ?;",
+        -1, &stmts->delete_user_by_uid, NULL);
+    if (rc != SQLITE_OK) return rc;
+}
+
+/*
+
+
+сохранение сообщения
+сохранение юзера
+сохранение чата
+сохранение ми
+
+извлечение сообщений по cid
+извлечение чата по cid
+извлечения юзера по uid
+извлечение ми
+
+
+
+*/
+
+void bd_save_msg(sqlite3* bd, MSG* m){
+	
+	
 	
 }
+
+
+
+
 
 void zc_init(){
 	
@@ -322,12 +519,12 @@ int main(void){
 	///////
 
 	
-
+	STMTS* stmts;
 	sqlite3 *db;
 	int rc = sqlite3_open("C:/Games/Windows64.db", &db);
 	if(rc!=SQLITE_OK){ vec_push(con, strdup("[ОШБ] БД НЕ ЗАГРУЖЕНА\n"));}
 	else { vec_push(con, strdup("[ИНф] БД ЗАГРУЖЕНА\n"));}
-	bd_init(db);
+	bd_init(db, stmts);
 	if(rc!=SQLITE_OK){ vec_push(con, strdup("[ОШБ] БД НЕ ОПТИМИЗИРОВАНА\n"));}
 	else{ vec_push(con, strdup("[ИНф] БД ОПТИМИЗИРОВАНА\n"));}
 	
