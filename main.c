@@ -25,7 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 //#include "uv.h"
-#define MAX_BLOB_SIZE =sizeof(unsigned short) - 32; 
+#define MAX_BLOB_SIZE sizeof(unsigned short) - 32
 struct AppFonts {
     struct GdiFont *f14;
     struct GdiFont *f16;
@@ -48,6 +48,34 @@ struct nk_image my_gui_image;
 extern char* _sas(char from[], unsigned short s);
 extern char* _sis(char from[], unsigned short s);
 
+unsigned char* byte_img(struct nk_image img){
+	HBITMAP hBitmap = (HBITMAP)img.handle.ptr;
+
+	// 1. Получаем параметры изображения
+	BITMAP bmp;
+	GetObject(hBitmap, sizeof(BITMAP), &bmp);
+
+	// 2. Подготавливаем заголовок для извлечения RGBA (32 бита)
+	BITMAPINFOHEADER bi;
+	bi.biSize = sizeof(BITMAPINFOHEADER);
+	bi.biWidth = bmp.bmWidth;
+	bi.biHeight = -bmp.bmHeight; // Отрицательное значение, чтобы изображение не было перевернутым
+	bi.biPlanes = 1;
+	bi.biBitCount = 32;
+	bi.biCompression = BI_RGB;
+	bi.biSizeImage = 0;
+
+	// 3. Выделяем память под массив байтов (char*)
+	int dataSize = bmp.bmWidth * bmp.bmHeight * 4;
+	unsigned char* pixels = (unsigned char*)malloc(dataSize);
+
+	// 4. Копируем данные из HBITMAP в наш массив
+	HDC hdc = GetDC(NULL);
+	GetDIBits(hdc, hBitmap, 0, bmp.bmHeight, pixels, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+	ReleaseDC(NULL, hdc);
+	return pixels;
+} // после использования надо free(pixels);
+
 typedef struct{
 	int mid;
 	uint8_t cid;
@@ -60,7 +88,7 @@ typedef struct{
 	uint8_t type; // 0 text  1 img  2 doc  4 server msg (invite join etc)
 	char* time;
 	char* name;
-} MSG;
+} msg;
 
 typedef struct{
 	char* name;
@@ -117,6 +145,7 @@ typedef struct {
 STMTS stmts;
 
 void bd_init(sqlite3* db, STMTS* stmts){
+	int rc;
 	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA synchronous = 0;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
@@ -196,21 +225,6 @@ void bd_init(sqlite3* db, STMTS* stmts){
         "WHERE CID = ? ORDER BY TIME ASC;",
         -1, &stmts->get_msgs_by_cid, NULL);
     if (rc != SQLITE_OK) return rc;
-    
-    // Получить сообщения чата с пагинацией (LIMIT/OFFSET)
-    rc = sqlite3_prepare_v2(db,
-        "SELECT MID, UID, TEXT, MEDIA, TYPE, TIME FROM MSGS "
-        "WHERE CID = ? ORDER BY TIME ASC LIMIT ? OFFSET ?;",
-        -1, &stmts->get_msgs_by_cid_range, NULL);
-    if (rc != SQLITE_OK) return rc;
-    
-    // Получить сообщения пользователя в чате
-    rc = sqlite3_prepare_v2(db,
-        "SELECT MID, TEXT, MEDIA, TYPE, TIME FROM MSGS "
-        "WHERE CID = ? AND UID = ? ORDER BY TIME ASC;",
-        -1, &stmts->get_msgs_by_cid_uid, NULL);
-    if (rc != SQLITE_OK) return rc;
-    
     // === ОБНОВЛЕНИЕ ===
     
     // Обновить OBN для ME
@@ -238,11 +252,6 @@ void bd_init(sqlite3* db, STMTS* stmts){
         "DELETE * FROM MSGS WHERE CID = ?;",
         -1, &stmts->delete_msgs_by_cid, NULL);
     if (rc != SQLITE_OK) return rc;
-	// Удалить 
-    rc = sqlite3_prepare_v2(db,
-        "DELETE * FROM USERS WHERE UID = ?;",
-        -1, &stmts->delete_user_by_uid, NULL);
-    if (rc != SQLITE_OK) return rc;
 }
 void finalize_all_statements(STMTS* stmts) {
     if (stmts->save_me) sqlite3_finalize(stmts->save_me);
@@ -254,12 +263,9 @@ void finalize_all_statements(STMTS* stmts) {
     if (stmts->get_user_by_name) sqlite3_finalize(stmts->get_user_by_name);
     if (stmts->get_chat_by_cid) sqlite3_finalize(stmts->get_chat_by_cid);
     if (stmts->get_msgs_by_cid) sqlite3_finalize(stmts->get_msgs_by_cid);
-    if (stmts->get_msgs_by_cid_range) sqlite3_finalize(stmts->get_msgs_by_cid_range);
-    if (stmts->get_msgs_by_cid_uid) sqlite3_finalize(stmts->get_msgs_by_cid_uid);
     if (stmts->update_me) sqlite3_finalize(stmts->update_me);
     if (stmts->update_user) sqlite3_finalize(stmts->update_user);
     if (stmts->update_chat) sqlite3_finalize(stmts->update_chat);
-    if (stmts->delete_msg_by_uid) sqlite3_finalize(stmts->delete_msg_by_uid);
     if (stmts->delete_msgs_by_cid) sqlite3_finalize(stmts->delete_msgs_by_cid);
 }
 /*
@@ -282,60 +288,68 @@ void finalize_all_statements(STMTS* stmts) {
 // ========== РЕАЛИЗАЦИЯ ФУНКЦИЙ СОХРАНЕНИЯ ==========
 void bd_save_me(sqlite3* db, ME* m) {
     sqlite3_reset(stmts.save_me);
+	unsigned char* c = byte_img(m->ava);
+	
     sqlite3_bind_blob(stmts.save_me, 1, _sas(m->name, strlen(m->name)),  strlen(m->name)+32 -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmts.save_me, 2, _sas(m->ava, m->ava.w*m->ava.h*4), 0, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmts.save_me, 2, _sas(c, m->ava.w*m->ava.h*4), 0, SQLITE_TRANSIENT);
     sqlite3_bind_blob(stmts.save_me, 3, m->hash, 64, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_me, 4, m->uid);
     sqlite3_bind_int(stmts.save_me, 5, m->ver ? 1 : 0);
     sqlite3_bind_text(stmts.save_me, 6, m->obn, -1, SQLITE_TRANSIENT);
     sqlite3_step(stmts.save_me);
+	free(c);
 }
 
 void bd_save_user(sqlite3* db, USER* u) {
     sqlite3_reset(stmts.save_user);
+	unsigned char* c = byte_img(u->ava);
     sqlite3_bind_text(stmts.save_user, 1, _sas(u->name, strlen(u->name)), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_user, 2, u->uid);
-    sqlite3_bind_blob(stmts.save_user, 3, _sas(m->ava, m->ava.w*m->ava.h*4), m->ava.w*m->ava.h*4, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmts.save_user, 3, _sas(c, u->ava.w*u->ava.h*4), u->ava.w*u->ava.h*4, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_user, 4, u->ver ? 1 : 0);
     sqlite3_bind_text(stmts.save_user, 5, u->obn, -1, SQLITE_TRANSIENT);
     sqlite3_step(stmts.save_user);
+	free(c);
 }
 
 void bd_save_chat(sqlite3* db, CHAT* c) {
     sqlite3_reset(stmts.save_chat);
-    sqlite3_bind_text(stmts.save_chat, 1, _sas(c->name, strlen(c->name)), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmts.save_chat, 2, "", 0, SQLITE_TRANSIENT); // AVA
+	unsigned char* cc = byte_img(c->ava);
+    sqlite3_bind_blob(stmts.save_chat, 1, _sas(c->name, strlen(c->name)), strlen(c->name)+32, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmts.save_chat, 2, _sas(cc, c->ava.w*c->ava.h*4), c->ava.w*c->ava.h*4, SQLITE_TRANSIENT); // AVA
     sqlite3_bind_int(stmts.save_chat, 3, c->cid);
     sqlite3_bind_text(stmts.save_chat, 4, c->mmbrs, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_chat, 5, c->lid);
     sqlite3_bind_text(stmts.save_chat, 6, c->obn, -1, SQLITE_TRANSIENT);
     sqlite3_step(stmts.save_chat);
+	free(cc);
 }
 
 // Сохранение сообщения с контролем памяти (<512MB)
-void bd_save_msg(sqlite3* db, MSG* m) {
+void bd_save_msg(sqlite3* db, msg* m) {
     sqlite3_reset(stmts.save_msg);
     sqlite3_bind_int(stmts.save_msg, 1, m->mid);
     sqlite3_bind_int(stmts.save_msg, 2, m->uid);
     sqlite3_bind_int(stmts.save_msg, 3, m->cid);
-
+	unsigned char* c;
     switch (m->type) {
         case 0: { // текст
             sqlite3_bind_blob(stmts.save_msg, 4, _sas(m->content.text, strlen(m->content.text)), strlen(m->content.text) + 32, SQLITE_TRANSIENT);
-            free(buf);
             break;
         }
-        case 1: { // изображение – предполагается, что content.img хранит указатель на RGBA
-            // В реальном проекте нужно получить размер данных (w*h*4). Для примера используем 0.
-            // Если данные отсутствуют или превышают лимит – не сохраняем.
+        case 1: { 
             size_t img_size = (size_t)m->content.img.w * m->content.img.h * 4;
             if (img_size > 0 && img_size <= MAX_BLOB_SIZE) {
-                sqlite3_bind_blob(stmts.save_msg, 5, m->context.img, img_size, SQLITE_TRANSIENT);
+				c = byte_img(m->content.img);
+                sqlite3_bind_blob(stmts.save_msg, 5, _sas(c, img_size), img_size+32, SQLITE_TRANSIENT);
             }
+			else{
+				
+			}
             break;
         }
-        case 2: { // документ – сохраняем путь в TEXT, файл не загружаем в память
-            sqlite3_bind_text(stmts.save_msg, 5, m->content.did, -1, SQLITE_TRANSIENT);
+        case 2: {
+            
             break;
         }
         default:
@@ -346,6 +360,7 @@ void bd_save_msg(sqlite3* db, MSG* m) {
     sqlite3_bind_int(stmts.save_msg, 6, m->type);
     sqlite3_bind_text(stmts.save_msg, 7, m->time, -1, SQLITE_TRANSIENT);
     sqlite3_step(stmts.save_msg);
+	free(c);
 }
 
 // ========== ФУНКЦИИ ИЗВЛЕЧЕНИЯ ==========
@@ -353,11 +368,16 @@ void bd_save_msg(sqlite3* db, MSG* m) {
 int bd_get_me(ME* out) {
     sqlite3_reset(stmts.get_me);
     if (sqlite3_step(stmts.get_me) == SQLITE_ROW) {
-        out->name = strdup((const char*)sqlite3_column_text(stmts.get_me, 0));
+		char* a = strdup((char*)sqlite3_column_text(stmts.get_me, 0));
+        out->name =_sis(a, strlen(a));
+		a = strdup((char*)sqlite3_column_text(stmts.get_me, 1));
+		out->hash = _sis(a, srtlen(a));
+		a = strdup((char*)sqlite3_column_text(stmts.get_me, 2));
+		out->ava = _sis(a, sqlite3_column_bytes(stmts.get_me, 2));
         out->uid = sqlite3_column_int(stmts.get_me, 3);
         out->ver = sqlite3_column_int(stmts.get_me, 4) != 0;
-        out->obn = strdup((const char*)sqlite3_column_text(stmts.get_me, 5));
-        // PASSW, AVA, hash не заполняем
+        out->obn = strdup((char*)sqlite3_column_text(stmts.get_me, 5));
+
         return 1;
     }
     return 0;
@@ -367,11 +387,14 @@ int bd_get_user_by_uid(uint8_t uid, USER* out) {
     sqlite3_reset(stmts.get_user_by_uid);
     sqlite3_bind_int(stmts.get_user_by_uid, 1, uid);
     if (sqlite3_step(stmts.get_user_by_uid) == SQLITE_ROW) {
-        out->name = strdup((const char*)sqlite3_column_text(stmts.get_user_by_uid, 0));
-        out->uid = uid;
+		char*a = strdup((char*)sqlite3_column_text(stmts.get_user_by_uid, 0));
+        out->name = _sis(strdup((char*)sqlite3_column_text(stmts.get_user_by_uid, 0)), strlen(a));
+		a= strdup((char*)sqlite3_column_text(stmts.get_user_by_uid, 1));
+		out->ava = _sis(a, sqlite3_column_bytes(stmts.get_me, 1));
+		out->uid = uid;
         out->ver = sqlite3_column_int(stmts.get_user_by_uid, 2) != 0;
         out->obn = strdup((const char*)sqlite3_column_text(stmts.get_user_by_uid, 3));
-        // AVA – заглушка
+        
         return 1;
     }
     return 0;
@@ -381,58 +404,61 @@ int bd_get_chat_by_cid(uint8_t cid, CHAT* out) {
     sqlite3_reset(stmts.get_chat_by_cid);
     sqlite3_bind_int(stmts.get_chat_by_cid, 1, cid);
     if (sqlite3_step(stmts.get_chat_by_cid) == SQLITE_ROW) {
-        out->name = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 0));
+		char*a = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 0));
+        out->name = _sis(a, strlen(a));
+		a = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 1));
+		out->ava = _sis(a, sqlite3_column_bytes(stmts.get_chat_by_cid, 1));
         out->cid = cid;
         out->mmbrs = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 2));
         out->lid = sqlite3_column_int(stmts.get_chat_by_cid, 3);
         out->obn = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 4));
-        // AVA – заглушка
         return 1;
     }
     return 0;
 }
 
-// Возвращает вектор сообщений (нужно освобождать каждый MSG и сам вектор)
-void bd_get_msgs_by_cid(uint8_t cid, MSG** msgs) {
+void bd_get_msgs_by_cid(uint8_t cid, msg** msgs) {
     sqlite3_reset(stmts.get_msgs_by_cid);
     sqlite3_bind_int(stmts.get_msgs_by_cid, 1, cid);
     while (sqlite3_step(stmts.get_msgs_by_cid) == SQLITE_ROW) {
-        MSG m;
+        msg m;
         memset(&m, 0, sizeof(MSG));
         m.mid = sqlite3_column_int(stmts.get_msgs_by_cid, 0);
         m.uid = sqlite3_column_int(stmts.get_msgs_by_cid, 1);
         m.type = sqlite3_column_int(stmts.get_msgs_by_cid, 4);
         m.time = strdup((const char*)sqlite3_column_text(stmts.get_msgs_by_cid, 5));
         
-        // Восстановление содержимого в зависимости от типа
         if (m.type == 0) { // текст
             const char* txt = (const char*)sqlite3_column_blob(stmts.get_msgs_by_cid, 2);
             int len = sqlite3_column_bytes(stmts.get_msgs_by_cid, 2);
             if (txt && len > 0) {
                 m.content.text = strdup(txt);
             } else {
-                m.content.text = strdup("");
+                m.content.text = strdup("ZC error");
             }
-        } else if (m.type == 2) { // документ – путь
+        } else if (m.type == 2) { // изображение
             const char* path = (const char*)sqlite3_column_text(stmts.get_msgs_by_cid, 3);
             if (path) m.content.did = strdup(path);
-        } else {
-            // Изображения и прочее – заглушка
-            m.content.text = NULL;
+        } else { // док
+            // m.content.did = ;
         }
         vec_push(*msgs, m);
     }
 } 
 
+
+uint64_t* bdu_get(){
+	
+}
+void bdu_save(uint64_t* hash){
+	
+}
+
 static void zc_chat(struct nk_context*ctx, int x, int y, struct AppFonts* fonts) {
  	if(nk_begin(ctx, "c", nk_rect(x*0.35, 0, x*0.65, y), NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR)) {
 		
 		nk_layout_row_dynamic(ctx, y*0.06, 1);
-		if(nk_group_begin(ctx, "p", NK_WINDOW_NO_SCROLLBAR)){
-			nk_fill_rect(nk_window_get_canvas(ctx), nk_rect(x*0.35+5, 5, x*0.2, y*0.06), rounding, nk_rgb(32,34,37));
-			nk_draw_image(nk_window_get_canvas(ctx), nk_rect(x*0.35+7, 7, y*0.055, y*0.055), &my_gui_image, nk_white);
-			nk_label(ctx, "Группа", NK_TEXT_LEFT);
-			nk_group_end(ctx);
+		if(nk_group_begin(ctx, "p", NK_WINDOW_NO_SCROLLBAR)){ 	nk_fill_rect(nk_window_get_canvas(ctx), nk_rect(x*0.35+5, 5, x*0.2, y*0.06), rounding, nk_rgb(32,34,37)); 	nk_draw_image(nk_window_get_canvas(ctx), nk_rect(x*0.35+7, 7, y*0.055, y*0.055), &my_gui_image, nk_white); 	nk_label(ctx, "Группа", NK_TEXT_LEFT); 	nk_group_end(ctx);
 		}
 
 		nk_layout_row_dynamic(ctx, y*0.865, 1);
