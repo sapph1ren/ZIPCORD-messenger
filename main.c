@@ -1,11 +1,20 @@
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0600
 #include <windows.h>
 #include <stdio.h>
-
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <process.h>
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ws2_32.lib")
 #include "vector.h"
+#define _CRT_NONSTDC_NO_DEPRECATE
 #include <string.h>
 #include <time.h>
 #include <limits.h>
+#define CH_COUNT 4
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -24,8 +33,10 @@
 #include "sqlite3.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include "zf.h"
 //#include "uv.h"
-#define MAX_BLOB_SIZE sizeof(unsigned short) - 32
+#define MAX_SIZE 65500
+
 struct AppFonts {
     struct GdiFont *f14;
     struct GdiFont *f16;
@@ -42,39 +53,118 @@ static char con_buffer[4096] = "привет! \v\n Привет!";
 int con_len;
 int con_max = 4096;
 struct nk_image my_gui_image;
-#include <string.h>
-
 
 extern char* _sas(char from[], unsigned short s);
 extern char* _sis(char from[], unsigned short s);
 
-unsigned char* byte_img(struct nk_image img){
-	HBITMAP hBitmap = (HBITMAP)img.handle.ptr;
 
-	// 1. Получаем параметры изображения
-	BITMAP bmp;
-	GetObject(hBitmap, sizeof(BITMAP), &bmp);
+HBITMAP create_gdi1_bitmap(int w, int h, unsigned char* data) {
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // Отрицательная высота, чтобы картинка не была перевернута
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-	// 2. Подготавливаем заголовок для извлечения RGBA (32 бита)
-	BITMAPINFOHEADER bi;
-	bi.biSize = sizeof(BITMAPINFOHEADER);
-	bi.biWidth = bmp.bmWidth;
-	bi.biHeight = -bmp.bmHeight; // Отрицательное значение, чтобы изображение не было перевернутым
-	bi.biPlanes = 1;
-	bi.biBitCount = 32;
-	bi.biCompression = BI_RGB;
-	bi.biSizeImage = 0;
+    HDC hdc = GetDC(NULL);
+    void* pBits = NULL;
+    HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+    if (hBitmap && pBits) {
+        memcpy(pBits, data, w * h * 4);
+    }
+    ReleaseDC(NULL, hdc);
+    return hBitmap;
+}
 
-	// 3. Выделяем память под массив байтов (char*)
-	int dataSize = bmp.bmWidth * bmp.bmHeight * 4;
-	unsigned char* pixels = (unsigned char*)malloc(dataSize);
+HBITMAP create_gdi_bitmap_from_raw(int w, int h, unsigned char* data) {
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // Чтобы не было перевернуто
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 24; // PPM обычно 3-канальный (RGB), а не 32 (RGBA)
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-	// 4. Копируем данные из HBITMAP в наш массив
-	HDC hdc = GetDC(NULL);
-	GetDIBits(hdc, hBitmap, 0, bmp.bmHeight, pixels, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
-	ReleaseDC(NULL, hdc);
-	return pixels;
-} // после использования надо free(pixels);
+    HDC hdc = GetDC(NULL);
+    void* pBits = NULL;
+    HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+    if (hBitmap && pBits) {
+        // GDI ожидает BGR, а в PPM лежит RGB. Нужно поменять каналы местами при копировании.
+        unsigned char* dest = (unsigned char*)pBits;
+        for (int i = 0; i < w * h; i++) {
+            dest[i * 3 + 0] = data[i * 3 + 2]; // B
+            dest[i * 3 + 1] = data[i * 3 + 1]; // G
+            dest[i * 3 + 2] = data[i * 3 + 0]; // R
+        }
+    }
+    ReleaseDC(NULL, hdc);
+    return hBitmap;
+}
+
+unsigned char* byte_img(struct nk_image* img) {
+    HBITMAP hBitmap = (HBITMAP)img->handle.ptr;
+    BITMAP bmp;
+    GetObject(hBitmap, sizeof(BITMAP), &bmp);
+
+    BITMAPINFOHEADER bi = {0};
+    bi.biSize = sizeof(BITMAPINFOHEADER);
+    bi.biWidth = bmp.bmWidth;
+    bi.biHeight = -bmp.bmHeight;
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = BI_RGB;
+
+    int dataSize = bmp.bmWidth * bmp.bmHeight * 4;
+    unsigned char* pixels = (unsigned char*)malloc(dataSize);
+
+    HDC hdc = GetDC(NULL);
+    GetDIBits(hdc, hBitmap, 0, bmp.bmHeight, pixels, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+    ReleaseDC(NULL, hdc);
+
+    for (int i = 0; i < dataSize; i += 4) {
+        unsigned char b = pixels[i];
+        unsigned char r = pixels[i + 2];
+        pixels[i] = r;
+        pixels[i + 2] = b;
+    }
+    return pixels;
+}
+
+unsigned char* pack_img(struct nk_image* img, int* out_size) {
+    int pixel_bytes = img->w * img->h * 4;
+    *out_size = 4 + pixel_bytes; 
+    unsigned char* packed = (unsigned char*)malloc(*out_size);
+    if (!packed) return NULL;
+
+    packed[0] = (img->w >> 0) & 0xFF;
+    packed[1] = (img->w >> 8) & 0xFF;
+    packed[2] = (img->h >> 0) & 0xFF;
+    packed[3] = (img->h >> 8) & 0xFF;
+
+    memcpy(packed + 4, byte_img(img), pixel_bytes);
+    return packed;
+}
+
+struct nk_image unpack_img(const unsigned char* blob, int blob_size) {
+    struct nk_image img = {0};
+    if (!blob || blob_size < 4) return img;
+
+    unsigned short w = (blob[1] << 8) | blob[0];
+    unsigned short h = (blob[3] << 8) | blob[2];
+    int expected_pixel_bytes = w * h * 4;
+    if (blob_size != 4 + expected_pixel_bytes) {
+        return img;
+    }
+    const unsigned char* pixels = blob + 4;
+    HBITMAP hbm = create_gdi1_bitmap(w, h, (unsigned char*)pixels);
+    img.handle.ptr = hbm;
+    img.w = w;
+    img.h = h;
+    return img;
+}
 
 typedef struct{
 	int mid;
@@ -83,7 +173,6 @@ typedef struct{
 	union {
 		char* text;
 		struct nk_image img;
-		char* did; // 0... - айди для скачивания  C:/ - путь до файла, чтобы открыть и не скачивать
 	} content;
 	uint8_t type; // 0 text  1 img  2 doc  4 server msg (invite join etc)
 	char* time;
@@ -144,7 +233,7 @@ typedef struct {
 
 STMTS stmts;
 
-void bd_init(sqlite3* db, STMTS* stmts){
+int bd_init(sqlite3* db, STMTS* stmts){
 	int rc;
 	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
 	sqlite3_exec(db, "PRAGMA synchronous = 0;", NULL, NULL, NULL);
@@ -244,12 +333,8 @@ void bd_init(sqlite3* db, STMTS* stmts){
         "UPDATE CHATS SET NAME = ?, AVA = ?, MMBRS = ?, OBN = ? WHERE CID = ?;",
         -1, &stmts->update_chat, NULL);
     if (rc != SQLITE_OK) return rc;
-    
-    // === УДАЛЕНИЕ ===
- 
-    // Удалить все сообщения чата
-    rc = sqlite3_prepare_v2(db,
-        "DELETE * FROM MSGS WHERE CID = ?;",
+
+    rc = sqlite3_prepare_v2(db, "DELETE FROM MSGS WHERE CID = ?;",
         -1, &stmts->delete_msgs_by_cid, NULL);
     if (rc != SQLITE_OK) return rc;
 }
@@ -268,197 +353,932 @@ void finalize_all_statements(STMTS* stmts) {
     if (stmts->update_chat) sqlite3_finalize(stmts->update_chat);
     if (stmts->delete_msgs_by_cid) sqlite3_finalize(stmts->delete_msgs_by_cid);
 }
-/*
 
-
-сохранение сообщения
-сохранение юзера
-сохранение чата
-сохранение ми
-
-извлечение сообщений по cid
-извлечение чата по cid
-извлечения юзера по uid
-извлечение ми
-
-
-
-*/
-
-// ========== РЕАЛИЗАЦИЯ ФУНКЦИЙ СОХРАНЕНИЯ ==========
 void bd_save_me(sqlite3* db, ME* m) {
     sqlite3_reset(stmts.save_me);
-	unsigned char* c = byte_img(m->ava);
-	
-    sqlite3_bind_blob(stmts.save_me, 1, _sas(m->name, strlen(m->name)),  strlen(m->name)+32 -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmts.save_me, 2, _sas(c, m->ava.w*m->ava.h*4), 0, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmts.save_me, 3, m->hash, 64, SQLITE_TRANSIENT);
+    int s;
+    unsigned char* ss = pack_img(&m->ava, &s);
+    
+    char* enc_name = _sas(m->name, strlen(m->name));
+    char* enc_img = _sas((char*)ss, s);
+
+    sqlite3_bind_blob(stmts.save_me, 1, enc_name, strlen(m->name) + 32, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmts.save_me, 2, m->hash, 64, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmts.save_me, 3, enc_img, s + 32, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_me, 4, m->uid);
     sqlite3_bind_int(stmts.save_me, 5, m->ver ? 1 : 0);
     sqlite3_bind_text(stmts.save_me, 6, m->obn, -1, SQLITE_TRANSIENT);
+    
     sqlite3_step(stmts.save_me);
-	free(c);
+
+    free(enc_name);
+    free(enc_img);
+    free(ss);
 }
 
 void bd_save_user(sqlite3* db, USER* u) {
     sqlite3_reset(stmts.save_user);
-	unsigned char* c = byte_img(u->ava);
-    sqlite3_bind_text(stmts.save_user, 1, _sas(u->name, strlen(u->name)), -1, SQLITE_TRANSIENT);
+    int s;
+    unsigned char* ss = pack_img(&u->ava, &s);
+    char* enc_name = _sas(u->name, strlen(u->name));
+    char* enc_img = _sas((char*)ss, s);
+
+    sqlite3_bind_blob(stmts.save_user, 1, enc_name, strlen(u->name) + 32, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_user, 2, u->uid);
-    sqlite3_bind_blob(stmts.save_user, 3, _sas(c, u->ava.w*u->ava.h*4), u->ava.w*u->ava.h*4, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmts.save_user, 3, enc_img, s + 32, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmts.save_user, 4, u->ver ? 1 : 0);
     sqlite3_bind_text(stmts.save_user, 5, u->obn, -1, SQLITE_TRANSIENT);
+    
     sqlite3_step(stmts.save_user);
-	free(c);
+
+    free(enc_name);
+    free(enc_img);
+    free(ss);
 }
 
-void bd_save_chat(sqlite3* db, CHAT* c) {
-    sqlite3_reset(stmts.save_chat);
-	unsigned char* cc = byte_img(c->ava);
-    sqlite3_bind_blob(stmts.save_chat, 1, _sas(c->name, strlen(c->name)), strlen(c->name)+32, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(stmts.save_chat, 2, _sas(cc, c->ava.w*c->ava.h*4), c->ava.w*c->ava.h*4, SQLITE_TRANSIENT); // AVA
-    sqlite3_bind_int(stmts.save_chat, 3, c->cid);
-    sqlite3_bind_text(stmts.save_chat, 4, c->mmbrs, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmts.save_chat, 5, c->lid);
-    sqlite3_bind_text(stmts.save_chat, 6, c->obn, -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmts.save_chat);
-	free(cc);
-}
-
-// Сохранение сообщения с контролем памяти (<512MB)
 void bd_save_msg(sqlite3* db, msg* m) {
     sqlite3_reset(stmts.save_msg);
     sqlite3_bind_int(stmts.save_msg, 1, m->mid);
     sqlite3_bind_int(stmts.save_msg, 2, m->uid);
     sqlite3_bind_int(stmts.save_msg, 3, m->cid);
-	unsigned char* c;
-    switch (m->type) {
-        case 0: { // текст
-            sqlite3_bind_blob(stmts.save_msg, 4, _sas(m->content.text, strlen(m->content.text)), strlen(m->content.text) + 32, SQLITE_TRANSIENT);
-            break;
-        }
-        case 1: { 
-            size_t img_size = (size_t)m->content.img.w * m->content.img.h * 4;
-            if (img_size > 0 && img_size <= MAX_BLOB_SIZE) {
-				c = byte_img(m->content.img);
-                sqlite3_bind_blob(stmts.save_msg, 5, _sas(c, img_size), img_size+32, SQLITE_TRANSIENT);
-            }
-			else{
-				
-			}
-            break;
-        }
-        case 2: {
-            
-            break;
-        }
-        default:
-            sqlite3_bind_null(stmts.save_msg, 4);
-            sqlite3_bind_null(stmts.save_msg, 5);
-            break;
+
+    if (m->type == 0 || m->type == 2) { // Текст или Док
+        char* enc = _sas(m->content.text, strlen(m->content.text));
+        sqlite3_bind_blob(stmts.save_msg, 4, enc, strlen(m->content.text) + 32, SQLITE_TRANSIENT);
+        free(enc);
+    } else if (m->type == 1) { // Изображение
+        int s;
+        unsigned char* packed = pack_img(&m->content.img, &s);
+        char* enc = _sas((char*)packed, s);
+        sqlite3_bind_blob(stmts.save_msg, 5, enc, s + 32, SQLITE_TRANSIENT);
+        free(enc);
+        free(packed);
     }
+
     sqlite3_bind_int(stmts.save_msg, 6, m->type);
     sqlite3_bind_text(stmts.save_msg, 7, m->time, -1, SQLITE_TRANSIENT);
     sqlite3_step(stmts.save_msg);
-	free(c);
 }
 
-// ========== ФУНКЦИИ ИЗВЛЕЧЕНИЯ ==========
-// Получить ME (выделяет память под строки, вызывающий должен освободить)
-int bd_get_me(ME* out) {
+
+
+
+
+
+ME bd_get_me() {
     sqlite3_reset(stmts.get_me);
+    ME out = {0};
     if (sqlite3_step(stmts.get_me) == SQLITE_ROW) {
-		char* a = strdup((char*)sqlite3_column_text(stmts.get_me, 0));
-        out->name =_sis(a, strlen(a));
-		a = strdup((char*)sqlite3_column_text(stmts.get_me, 1));
-		out->hash = _sis(a, srtlen(a));
-		a = strdup((char*)sqlite3_column_text(stmts.get_me, 2));
-		out->ava = _sis(a, sqlite3_column_bytes(stmts.get_me, 2));
-        out->uid = sqlite3_column_int(stmts.get_me, 3);
-        out->ver = sqlite3_column_int(stmts.get_me, 4) != 0;
-        out->obn = strdup((char*)sqlite3_column_text(stmts.get_me, 5));
+        // Name
+        int len0 = sqlite3_column_bytes(stmts.get_me, 0);
+        out.name = _sis((char*)sqlite3_column_blob(stmts.get_me, 0), len0 - 32);
 
-        return 1;
+        // Hash
+        int len1 = sqlite3_column_bytes(stmts.get_me, 1);
+        out.hash = malloc(len1 + 1);
+        memcpy(out.hash, sqlite3_column_blob(stmts.get_me, 1), len1);
+        out.hash[len1] = 0;
+
+        // Ava
+        int len2 = sqlite3_column_bytes(stmts.get_me, 2);
+        char* dec_ava = _sis((char*)sqlite3_column_blob(stmts.get_me, 2), len2 - 32);
+        out.ava = unpack_img((unsigned char*)dec_ava, len2 - 32);
+        free(dec_ava);
+
+        out.uid = sqlite3_column_int(stmts.get_me, 3);
+        out.ver = sqlite3_column_int(stmts.get_me, 4) != 0;
+        const char* obn = (const char*)sqlite3_column_text(stmts.get_me, 5);
+        if (obn) out.obn = strdup(obn);
     }
-    return 0;
+    return out;
 }
 
-int bd_get_user_by_uid(uint8_t uid, USER* out) {
+USER bd_get_user_by_uid(uint8_t uid) {
     sqlite3_reset(stmts.get_user_by_uid);
     sqlite3_bind_int(stmts.get_user_by_uid, 1, uid);
+    USER out = {0}; // Обнуляем, чтобы не было мусора если строка не найдется
+
     if (sqlite3_step(stmts.get_user_by_uid) == SQLITE_ROW) {
-		char*a = strdup((char*)sqlite3_column_text(stmts.get_user_by_uid, 0));
-        out->name = _sis(strdup((char*)sqlite3_column_text(stmts.get_user_by_uid, 0)), strlen(a));
-		a= strdup((char*)sqlite3_column_text(stmts.get_user_by_uid, 1));
-		out->ava = _sis(a, sqlite3_column_bytes(stmts.get_me, 1));
-		out->uid = uid;
-        out->ver = sqlite3_column_int(stmts.get_user_by_uid, 2) != 0;
-        out->obn = strdup((const char*)sqlite3_column_text(stmts.get_user_by_uid, 3));
+        // Получаем Имя
+        int len0 = sqlite3_column_bytes(stmts.get_user_by_uid, 0);
+        if (len0 > 32) {
+            out.name = _sis((char*)sqlite3_column_blob(stmts.get_user_by_uid, 0), len0 - 32);
+        }
+
+        // Получаем Аву
+        int len1 = sqlite3_column_bytes(stmts.get_user_by_uid, 1);
+        if (len1 > 32) {
+            char* decrypted_ava = _sis((char*)sqlite3_column_blob(stmts.get_user_by_uid, 1), len1 - 32);
+            out.ava = unpack_img((unsigned char*)decrypted_ava, len1 - 32);
+            free(decrypted_ava); // Освобождаем временный буфер после распаковки
+        }
+
+        out.uid = uid;
+        out.ver = sqlite3_column_int(stmts.get_user_by_uid, 2) != 0;
         
-        return 1;
+        const char* obn_ptr = (const char*)sqlite3_column_text(stmts.get_user_by_uid, 3);
+        if (obn_ptr) out.obn = strdup(obn_ptr);
     }
-    return 0;
+    return out;
 }
 
-int bd_get_chat_by_cid(uint8_t cid, CHAT* out) {
+CHAT bd_get_chat_by_cid(uint8_t cid) {
     sqlite3_reset(stmts.get_chat_by_cid);
     sqlite3_bind_int(stmts.get_chat_by_cid, 1, cid);
+    CHAT out = {0};
+
     if (sqlite3_step(stmts.get_chat_by_cid) == SQLITE_ROW) {
-		char*a = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 0));
-        out->name = _sis(a, strlen(a));
-		a = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 1));
-		out->ava = _sis(a, sqlite3_column_bytes(stmts.get_chat_by_cid, 1));
-        out->cid = cid;
-        out->mmbrs = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 2));
-        out->lid = sqlite3_column_int(stmts.get_chat_by_cid, 3);
-        out->obn = strdup((const char*)sqlite3_column_text(stmts.get_chat_by_cid, 4));
-        return 1;
+        // Имя чата
+        int len0 = sqlite3_column_bytes(stmts.get_chat_by_cid, 0);
+        if (len0 > 32) {
+            out.name = _sis((char*)sqlite3_column_blob(stmts.get_chat_by_cid, 0), len0 - 32);
+        }
+
+        // Ава чата
+        int len1 = sqlite3_column_bytes(stmts.get_chat_by_cid, 1);
+        if (len1 > 32) {
+            char* decrypted_ava = _sis((char*)sqlite3_column_blob(stmts.get_chat_by_cid, 1), len1 - 32);
+            out.ava = unpack_img((unsigned char*)decrypted_ava, len1 - 32);
+            free(decrypted_ava); 
+        }
+
+        out.cid = cid;
+
+        const char* mmb = (const char*)sqlite3_column_text(stmts.get_chat_by_cid, 2);
+        if (mmb) out.mmbrs = strdup(mmb);
+
+        out.lid = sqlite3_column_int(stmts.get_chat_by_cid, 3);
+
+        const char* obn = (const char*)sqlite3_column_text(stmts.get_chat_by_cid, 4);
+        if (obn) out.obn = strdup(obn);
     }
-    return 0;
+    return out;
 }
+
 
 void bd_get_msgs_by_cid(uint8_t cid, msg** msgs) {
     sqlite3_reset(stmts.get_msgs_by_cid);
     sqlite3_bind_int(stmts.get_msgs_by_cid, 1, cid);
     while (sqlite3_step(stmts.get_msgs_by_cid) == SQLITE_ROW) {
-        msg m;
-        memset(&m, 0, sizeof(MSG));
+        msg m = {0};
         m.mid = sqlite3_column_int(stmts.get_msgs_by_cid, 0);
         m.uid = sqlite3_column_int(stmts.get_msgs_by_cid, 1);
         m.type = sqlite3_column_int(stmts.get_msgs_by_cid, 4);
         m.time = strdup((const char*)sqlite3_column_text(stmts.get_msgs_by_cid, 5));
         
-        if (m.type == 0) { // текст
-            const char* txt = (const char*)sqlite3_column_blob(stmts.get_msgs_by_cid, 2);
+        if (m.type == 0 || m.type == 2) {
             int len = sqlite3_column_bytes(stmts.get_msgs_by_cid, 2);
-            if (txt && len > 0) {
-                m.content.text = strdup(txt);
-            } else {
-                m.content.text = strdup("ZC error");
-            }
-        } else if (m.type == 2) { // изображение
-            const char* path = (const char*)sqlite3_column_text(stmts.get_msgs_by_cid, 3);
-            if (path) m.content.did = strdup(path);
-        } else { // док
-            // m.content.did = ;
+            m.content.text = _sis((char*)sqlite3_column_blob(stmts.get_msgs_by_cid, 2), len - 32);
+        } else if (m.type == 1) {
+            int len = sqlite3_column_bytes(stmts.get_msgs_by_cid, 3);
+            char* dec = _sis((char*)sqlite3_column_blob(stmts.get_msgs_by_cid, 3), len - 32);
+            m.content.img = unpack_img((unsigned char*)dec, len - 32);
+            free(dec);
         }
         vec_push(*msgs, m);
     }
-} 
-
+}
 
 uint64_t* bdu_get(){
-	
+	FILE* f = fopen("setup.bdu", "rb+");
+	uint64_t* o;
+    fseek(f, 0, SEEK_END);
+    int a = ftell(f);
+    fseek(f, 0, SEEK_SET);
+	char* b;
+	fread(b, 1, a, f);
+	memcpy(o, _sis(b, a-32), sizeof(uint64_t));
+	fclose(f);
+	return o;
 }
+
 void bdu_save(uint64_t* hash){
+	FILE* f = fopen("setup.bdu", "rb+");
+	fwrite(_sas((char*)hash, 96), 1, 96, f);
+	fclose(f);	
+}
+
+uint64_t* hash(char* pass){
+	return SHA512Hash((uint8_t)pass, strlen(pass));
+}
+
+bool check_hash(uint64_t* a, uint64_t* b){
+	if (a==b){
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+// // сетевая часть
+// typedef enum {ZC_UDP=0, ZC_TCP_T =1 , ZC_TCP_M=2, ZC_TCP_S=3} ZC_ITYPE;
+// typedef struct {
+//     char ip[64];
+//     int ports[CH_COUNT];
+// } NetConfig;
+
+// typedef struct {
+// 	ZC_ITYPE chan;
+// 	uint16_t len;
+// 	uint8_t* data; // svec
+// } zc_ipacket;
+
+// typedef struct {
+// 	SOCKET sckts[4]; // 0 audio 1 text 2 media 3 sys
+// 	HANDLE h_events[4];
+// 	ma_pcm_rb audio_buf;
+// 	struct sockaddr_in server_ip;
+// 	volatile bool running = true;
+// 	volatile bool in_voice = false;
+// 	CRITICAL_SECTION send_lock;
+// 	NetConfig cfg;
+// 	zc_ipacket* sendq = NULL;
+// } sckts;
+
+// void process_packet(ZC_ITYPE type, uint8_t* data, uint16_t len) {
+//     if (type == ZC_TCP_T) {
+//         printf("[TEXT] %.*s\n", len, data);
+//     } else if (type == ZC_TCP_M) {
+//         printf("[MEDIA] Received %d bytes\n", len);
+//     }
+// 	else if (type == ZC_TCP_S){
+		
+// 	}
+// }
+
+// void zc_inaudio(sckts* s){
+// 	float buf[1024];
+// 	int bytes = recvfrom(s->sckts[0], (unsigned char*)buf, sizeof(of), 0, NULL, NULL);
+// 	if (bytes >0){
+// 		ma_uint32 f = bytes/(sizeof(float));
+// 		ma_pcm_rb_write(&s->audio_buf, buf, &f);
+// 	}
+// }
+
+// void zc_intext(zc_ipacket* z){
+// 	uint8_t buf[65536];
 	
+// }
+
+// void zc_insys(void){
+	
+// }
+
+// void zc_inmedia(void){
+	
+// }
+
+// int send_all(SOCKET s, const void* data, int len) {
+//     const char* ptr = (const char*)data;
+//     int sent_total = 0;
+//     while (sent_total < len) {
+//         int sent = send(s, ptr + sent_total, len - sent_total, 0);
+//         if (sent == SOCKET_ERROR) {
+//             if (WSAGetLastError() == WSAEWOULDBLOCK) {
+//                 Sleep(1); // Ждем освобождения TCP буфера
+//                 continue;
+//             }
+//             return -1;
+//         }
+//         sent_total += sent;
+//     }
+//     return 0;
+// }
+
+// int recv_all(SOCKET s, void* buf, int len) {
+//     char* ptr = (char*)buf;
+//     int read_total = 0;
+//     while (read_total < len) {
+//         int r = recv(s, ptr + read_total, len - read_total, 0);
+//         if (r > 0) {
+//             read_total += r;
+//         } else if (r == 0) {
+//             return -1; // Graceful close
+//         } else if (r == SOCKET_ERROR) {
+//             if (WSAGetLastError() == WSAEWOULDBLOCK) {
+//                 Sleep(1); // Данные еще в пути
+//                 continue;
+//             }
+//             return -1; // Hard error
+//         }
+//     }
+//     return read_total;
+// }
+
+// void reconnect_channel(sckts* ctx, int idx) {
+//     printf("[NET] Reconnecting channel %d...\n", idx);
+    
+//     // 1. Сброс и закрытие
+//     WSAEventSelect(ctx->sckts[idx], NULL, 0);
+//     closesocket(ctx->sckts[idx]);
+
+//     // 2. Создание нового сокета
+//     int type = (idx == ZC_UDP) ? SOCK_DGRAM : SOCK_STREAM;
+//     int proto = (idx == ZC_UDP) ? IPPROTO_UDP : IPPROTO_TCP;
+//     ctx->sckts[idx] = socket(AF_INET, type, proto);
+
+//     // 3. Non-blocking mode
+//     u_long mode = 1;
+//     ioctlsocket(ctx->sckts[idx], FIONBIO, &mode);
+
+//     // 4. Connect (TCP only)
+//     struct sockaddr_in addr = {0};
+//     addr.sin_family = AF_INET;
+//     addr.sin_port = htons(ctx->config.ports[idx]);
+//     inet_pton(AF_INET, ctx->config.ip, &addr.sin_addr);
+
+//     if (idx != ZC_UDP) {
+//         while (connect(ctx->sckts[idx], (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+//             if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+//             Sleep(500); // Backoff
+//         }
+//     } else {
+//         // Для UDP connect нужен, чтобы работал send() без указания адреса каждый раз
+//         connect(ctx->sckts[idx], (struct sockaddr*)&addr, sizeof(addr)); 
+//     }
+
+//     // 5. Привязка события
+//     // Важно: h_events[idx] создается один раз в init, здесь мы его переиспользуем
+//     WSAEventSelect(ctx->sckts[idx], ctx->h_events[idx], FD_READ | FD_CLOSE);
+//     printf("[NET] Channel %d connected.\n", idx);
+// }
+
+// void i_c(void* arg) {
+//     sckts* s = (sckts*)arg;
+    
+//     while (s->running) {
+//         // Ждем событий сети ИЛИ таймаут 5мс для проверки очереди отправки
+//         DWORD r = WaitForMultipleObjects(CH_COUNT, s->h_events, FALSE, 5);
+        
+//         // --- 1. NETWORK RECEIVE ---
+//         if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + CH_COUNT) {
+//             int idx = r - WAIT_OBJECT_0;
+//             WSANETWORKEVENTS e;
+//             WSAEnumNetworkEvents(s->sckts[idx], s->h_events[idx], &e);
+
+//             if (e.lNetworkEvents & FD_CLOSE) {
+//                 reconnect_channel(s, idx);
+//             }
+//             else if (e.lNetworkEvents & FD_READ) {
+//                 if (idx == ZC_UDP) {
+//                     zc_inaudio(s);
+//                 } 
+//                 else {
+//                     // TCP: Text, Media, Sys
+//                     uint16_t net_len = 0;
+                    
+//                     // Сначала читаем заголовок (2 байта)
+//                     // Используем MSG_PEEK, чтобы проверить наличие 2 байт, или recv_all с таймаутом
+//                     int res = recv_all(s->sckts[idx], &net_len, 2);
+                    
+//                     if (res == 2) {
+//                         uint16_t len = ntohs(net_len); // Конвертация Endianness
+                        
+//                         // Выделяем буфер (или используем вектор)
+//                         uint8_t* body = NULL;
+//                         // Резервируем место в векторе
+//                         // (предполагается, что vector.h поддерживает resize или делаем push в цикле)
+//                         // Для эффективности лучше выделить malloc, если vector.h медленный на push
+//                         uint8_t* temp_buf = (uint8_t*)malloc(len);
+                        
+//                         if (recv_all(s->sckts[idx], temp_buf, len) == len) {
+//                             process_packet((ZC_ITYPE)idx, temp_buf, len);
+//                         } else {
+//                             reconnect_channel(s, idx); // Обрыв на теле пакета
+//                         }
+//                         free(temp_buf);
+//                     } 
+//                     else if (res < 0) {
+//                         reconnect_channel(s, idx);
+//                     }
+//                 }
+//             }
+//         }
+
+//         // --- 2. NETWORK SEND ---
+//         // Проверяем очередь
+//         EnterCriticalSection(&s->send_lock);
+//         if (vec_size(s->sendq) > 0) {
+//             // Забираем пакет
+//             zc_ipacket p = s->sendq[0];
+//             vec_remove(s->sendq, 0); // Удаляем из головы (O(N), для вектора плохо, лучше RingBuffer, но сойдет)
+//             LeaveCriticalSection(&s->send_lock);
+
+//             int res = 0;
+//             if (p.chan == ZC_UDP) {
+//                 // Аудио шлем без заголовка длины
+//                 res = send(s->sckts[p.chan], (const unsigned char*)p.data, vec_size(p.data), 0);
+//             } else {
+//                 // TCP: Добавляем заголовок длины
+//                 uint16_t len = (uint16_t)vec_size(p.data);
+//                 uint16_t net_len = htons(len);
+                
+//                 // Шлем длину
+//                 if (send_all(s->sckts[p.chan], &net_len, 2) < 0) res = -1;
+//                 // Шлем тело
+//                 else if (send_all(s->sckts[p.chan], p.data, len) < 0) res = -1;
+//             }
+
+//             if (res < 0) reconnect_channel(s, p.chan);
+            
+//             vec_free(p.data);
+            
+//             // Снова лочим для следующей проверки цикла while или выхода
+//             EnterCriticalSection(&s->send_lock);
+//         }
+//         LeaveCriticalSection(&s->send_lock);
+//     }
+// }
+
+// void net_send(sckts* s, ZC_ITYPE type, const void* data, int len) {
+//     if (type == ZC_UDP) {
+//         // UDP можно слать сразу, если не боишься блокировки (редко для UDP)
+//         // Или добавить в очередь как обычно
+//         send(s->sckts[ZC_UDP], (const unsigned char*)data, len, 0);
+//         return;
+//     }
+
+//     zc_ipacket p;
+//     p.chan = type;
+//     p.data = NULL;
+    
+//     // Копируем данные в вектор
+//     const uint8_t* bytes = (const uint8_t*)data;
+//     for (int i = 0; i < len; i++) vec_push(p.data, bytes[i]);
+
+//     EnterCriticalSection(&s->send_lock);
+//     vec_push(s->sendq, p);
+//     LeaveCriticalSection(&s->send_lock);
+// }
+
+
+// void init_system(sckts* s, const char* ip) {
+//     WSAData wsa;
+//     WSAStartup(MAKEWORD(2, 2), &wsa);
+    
+//     InitializeCriticalSection(&s->send_lock);
+//     s->running = TRUE;
+//     s->sendq = NULL;
+    
+//     // Сохраняем конфиг
+//     strncpy(s->config.ip, ip, 63);
+//     s->config.ports[0] = 5000; // UDP
+//     s->config.ports[1] = 5001; // Text
+//     s->config.ports[2] = 5002; // Media
+//     s->config.ports[3] = 5003; // Sys
+
+//     // Первичное подключение
+//     for (int i = 0; i < CH_COUNT; i++) {
+//         s->h_events[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+//         // Фиктивный сокет, чтобы reconnect создал реальный
+//         s->sckts[i] = socket(AF_INET, SOCK_STREAM, 0); 
+//         reconnect_channel(s, i); // Вся магия создания там
+//     }
+
+//     ma_pcm_rb_init(ma_format_f32, 1, 48000 * 2, NULL, NULL, &s->audio_rb);
+    
+//     // Запуск потока
+//     _beginthread(i_c, 0, s);
+// }
+ // укладывается в uint16_t
+typedef enum { ZC_UDP = 0, ZC_TCP_T = 1, ZC_TCP_M = 2, ZC_TCP_S = 3 } ZC_ITYPE;
+typedef enum { CHAN_DISCONNECTED, CHAN_CONNECTING, CHAN_ACTIVE } ChanState;
+
+typedef struct {
+    char ip[64];
+    int ports[CH_COUNT];
+} NetConfig;
+
+// Буфер приёма для TCP-канала
+typedef struct {
+    uint8_t* data;          // выделен один раз размером MAX_TCP_PACKET_SIZE
+    uint16_t   capacity;      // = MAX_TCP_PACKET_SIZE
+    uint16_t   offset;        // сколько байт уже прочитано в текущем пакете
+    uint16_t expected_len;  // ожидаемая длина тела (после чтения заголовка)
+    enum { WAIT_LEN, WAIT_BODY } state;
+} TcpRxBuffer;
+
+// Канал (TCP или UDP)
+typedef struct {
+    SOCKET socket;
+    ChanState state;
+    HANDLE hEvent;          // событие для WSAEventSelect
+    // для TCP:
+    TcpRxBuffer rx;
+    // критическая секция на канал (защищает state, socket, rx)
+    CRITICAL_SECTION lock;
+} Channel;
+
+// Основная структура сетевого движка
+typedef struct {
+    Channel channels[CH_COUNT];
+    struct sockaddr_in server_addr;
+    ma_pcm_rb audio_rb;
+    volatile bool running;
+    volatile bool in_voice;
+
+    // Очередь отправки
+    struct SendItem {
+        ZC_ITYPE chan;
+        const uint8_t* data;
+        size_t len;
+        bool owns_data;         // true, если нужно вызвать free(data)
+        struct SendItem* next;
+    } *sendq_head, *sendq_tail;
+    CRITICAL_SECTION sendq_lock;
+
+    NetConfig config;
+} NetworkEngine;
+
+static void init_tcp_rx_buffer(TcpRxBuffer* rx) {
+    rx->data = (uint8_t*)malloc(MAX_SIZE);
+    rx->capacity = MAX_SIZE;
+    rx->offset = 0;
+    rx->expected_len = 0;
+    rx->state = WAIT_LEN;
+}
+
+static void free_tcp_rx_buffer(TcpRxBuffer* rx) {
+    free(rx->data);
+    rx->data = NULL;
+}
+
+// Инициализация отдельного канала
+static void channel_init(Channel* ch, ZC_ITYPE idx, HANDLE hEvent) {
+    InitializeCriticalSection(&ch->lock);
+    ch->hEvent = hEvent;
+    ch->state = CHAN_DISCONNECTED;
+    ch->socket = INVALID_SOCKET;
+    if (idx != ZC_UDP) {
+        init_tcp_rx_buffer(&ch->rx);
+    }
+}
+
+static void channel_cleanup(Channel* ch) {
+    EnterCriticalSection(&ch->lock);
+    if (ch->socket != INVALID_SOCKET) {
+        WSAEventSelect(ch->socket, NULL, 0);
+        closesocket(ch->socket);
+        ch->socket = INVALID_SOCKET;
+    }
+    ch->state = CHAN_DISCONNECTED;
+    if (ch->rx.data) {
+        // сбрасываем состояние буфера
+        ch->rx.offset = 0;
+        ch->rx.state = WAIT_LEN;
+    }
+    LeaveCriticalSection(&ch->lock);
+    DeleteCriticalSection(&ch->lock);
+}
+
+// Возвращает true, если канал был в рабочем состоянии и нуждается в переподключении
+static bool channel_needs_reconnect(Channel* ch) {
+    return (ch->state == CHAN_DISCONNECTED);
+}
+
+// Выполняет асинхронное подключение TCP-канала
+static void channel_start_connect(Channel* ch, const struct sockaddr_in* addr) {
+    ch->state = CHAN_CONNECTING;
+    ch->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    u_long mode = 1;
+    ioctlsocket(ch->socket, FIONBIO, &mode);
+
+    // Привязываем событие до connect, чтобы поймать FD_CONNECT
+    WSAEventSelect(ch->socket, ch->hEvent, FD_CONNECT | FD_READ | FD_CLOSE);
+
+    int ret = connect(ch->socket, (const struct sockaddr*)addr, sizeof(*addr));
+    if (ret == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            // мгновенная ошибка подключения
+            closesocket(ch->socket);
+            ch->socket = INVALID_SOCKET;
+            ch->state = CHAN_DISCONNECTED;
+        }
+        // иначе подключение в процессе, FD_CONNECT сообщит о результате
+    } else {
+        // редкий случай: подключение произошло мгновенно
+        ch->state = CHAN_ACTIVE;
+    }
+}
+
+// Переподключает указанный канал (или все отключенные, если chan == -1)
+void network_reconnect(NetworkEngine* net, ZC_ITYPE chan) {
+    if (chan == -1) {
+        for (int i = 0; i < CH_COUNT; i++) {
+            if (channel_needs_reconnect(&net->channels[i]))
+                network_reconnect(net, (ZC_ITYPE)i);
+        }
+        return;
+    }
+
+    Channel* ch = &net->channels[chan];
+    EnterCriticalSection(&ch->lock);
+
+    if (!channel_needs_reconnect(ch)) {
+        LeaveCriticalSection(&ch->lock);
+        return; // уже подключен или в процессе
+    }
+
+    // Закрываем старый сокет, если есть
+    if (ch->socket != INVALID_SOCKET) {
+        WSAEventSelect(ch->socket, NULL, 0);
+        closesocket(ch->socket);
+        ch->socket = INVALID_SOCKET;
+    }
+
+    // Сбрасываем состояние приёма
+    if (chan != ZC_UDP) {
+        ch->rx.offset = 0;
+        ch->rx.state = WAIT_LEN;
+    }
+
+    // Создаём новый сокет и запускаем подключение
+    if (chan == ZC_UDP) {
+        ch->socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        u_long mode = 1;
+        ioctlsocket(ch->socket, FIONBIO, &mode);
+        // Для UDP "connect" нужен, чтобы send работал без указания адреса
+        connect(ch->socket, (const struct sockaddr*)&net->server_addr, sizeof(net->server_addr));
+        WSAEventSelect(ch->socket, ch->hEvent, FD_READ | FD_CLOSE);
+        ch->state = CHAN_ACTIVE; // UDP всегда активен после connect
+    } else {
+        channel_start_connect(ch, &net->server_addr);
+    }
+
+    LeaveCriticalSection(&ch->lock);
+}
+
+// Добавление элемента в очередь отправки. 
+// data должна быть выделена через malloc (или быть статической, но тогда owns_data = false).
+void network_send(NetworkEngine* net, ZC_ITYPE chan, const void* data, size_t len, bool owns_data) {
+    if (len == 0) return;
+
+    // Для UDP шлём сразу (UDP send редко блокируется)
+    if (chan == ZC_UDP) {
+        Channel* ch = &net->channels[chan];
+        EnterCriticalSection(&ch->lock);
+        if (ch->state == CHAN_ACTIVE && ch->socket != INVALID_SOCKET) {
+            send(ch->socket, (const char*)data, (int)len, 0);
+        }
+        LeaveCriticalSection(&ch->lock);
+        if (owns_data) free((void*)data);
+        return;
+    }
+
+    // TCP: кладём в очередь
+    struct SendItem* item = (struct SendItem*)malloc(sizeof(struct SendItem));
+    item->chan = chan;
+    item->data = (const uint8_t*)data;
+    item->len = len;
+    item->owns_data = owns_data;
+    item->next = NULL;
+
+    EnterCriticalSection(&net->sendq_lock);
+    if (net->sendq_tail) {
+        net->sendq_tail->next = item;
+        net->sendq_tail = item;
+    } else {
+        net->sendq_head = net->sendq_tail = item;
+    }
+    LeaveCriticalSection(&net->sendq_lock);
+}
+
+static void process_tcp_receive(Channel* ch, ZC_ITYPE chan_type) {
+    SOCKET sock = ch->socket;
+    TcpRxBuffer* rx = &ch->rx;
+    uint8_t* buf = rx->data;
+    size_t capacity = rx->capacity;
+
+    while (1) {
+        if (rx->state == WAIT_LEN) {
+            // Пытаемся прочитать 2 байта длины
+            uint8_t len_buf[2];
+            size_t needed = 2 - rx->offset;
+            int r = recv(sock, (char*)len_buf + rx->offset, (int)needed, 0);
+            if (r > 0) {
+                rx->offset += r;
+                if (rx->offset == 2) {
+                    uint16_t net_len = *(uint16_t*)len_buf;
+                    rx->expected_len = ntohs(net_len);
+                    if (rx->expected_len > capacity) {
+                        // Слишком большой пакет — разрываем соединение
+                        goto disconnect;
+                    }
+                    rx->state = WAIT_BODY;
+                    rx->offset = 0;
+                }
+            } else if (r == 0) {
+                goto disconnect;
+            } else {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK) break; // больше нет данных
+                else goto disconnect;
+            }
+        }
+
+        if (rx->state == WAIT_BODY) {
+            size_t needed = rx->expected_len - rx->offset;
+            int r = recv(sock, (char*)buf + rx->offset, (int)needed, 0);
+            if (r > 0) {
+                rx->offset += r;
+                if (rx->offset == rx->expected_len) {
+                    // Пакет получен полностью
+                    process_packet(chan_type, buf, rx->expected_len);
+                    rx->state = WAIT_LEN;
+                    rx->offset = 0;
+                }
+            } else if (r == 0) {
+                goto disconnect;
+            } else {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK) break;
+                else goto disconnect;
+            }
+        }
+    }
+    return;
+
+disconnect:
+    ch->state = CHAN_DISCONNECTED;
+    // закроем сокет позже в reconnect
+}
+
+static void process_udp_receive(NetworkEngine* net) {
+    Channel* ch = &net->channels[ZC_UDP];
+    float buf[1024];
+    int bytes = recvfrom(ch->socket, (char*)buf, sizeof(buf), 0, NULL, NULL);
+    if (bytes > 0) {
+        ma_uint32 frames = bytes / sizeof(float);
+        ma_pcm_rb_write(&net->audio_rb, buf, &frames);
+    }
+}
+
+static void process_send_queue(NetworkEngine* net) {
+    EnterCriticalSection(&net->sendq_lock);
+    while (net->sendq_head) {
+        struct SendItem* item = net->sendq_head;
+        net->sendq_head = item->next;
+        if (!net->sendq_head) net->sendq_tail = NULL;
+        LeaveCriticalSection(&net->sendq_lock);
+
+        Channel* ch = &net->channels[item->chan];
+        EnterCriticalSection(&ch->lock);
+        bool send_ok = true;
+        if (ch->state == CHAN_ACTIVE && ch->socket != INVALID_SOCKET) {
+            // Отправляем длину (2 байта) + данные
+            uint16_t net_len = htons((uint16_t)item->len);
+            if (send_all(ch->socket, &net_len, 2) < 0) {
+                send_ok = false;
+            } else if (send_all(ch->socket, item->data, (int)item->len) < 0) {
+                send_ok = false;
+            }
+        } else {
+            send_ok = false;
+        }
+
+        if (!send_ok) {
+            ch->state = CHAN_DISCONNECTED;
+        }
+        LeaveCriticalSection(&ch->lock);
+
+        if (item->owns_data) free((void*)item->data);
+        free(item);
+
+        EnterCriticalSection(&net->sendq_lock);
+    }
+    LeaveCriticalSection(&net->sendq_lock);
+}
+
+// Потоковая функция
+static void network_thread(void* arg) {
+    NetworkEngine* net = (NetworkEngine*)arg;
+    HANDLE events[CH_COUNT];
+    for (int i = 0; i < CH_COUNT; i++) events[i] = net->channels[i].hEvent;
+
+    while (net->running) {
+        DWORD r = WaitForMultipleObjects(CH_COUNT, events, FALSE, 50); // таймаут для периодической проверки очереди отправки
+
+        // Обработка сетевых событий
+        if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + CH_COUNT) {
+            int idx = r - WAIT_OBJECT_0;
+            Channel* ch = &net->channels[idx];
+            WSANETWORKEVENTS net_events;
+            EnterCriticalSection(&ch->lock);
+            if (ch->socket != INVALID_SOCKET) {
+                WSAEnumNetworkEvents(ch->socket, ch->hEvent, &net_events);
+            } else {
+                net_events.lNetworkEvents = 0;
+            }
+
+            // Обработка FD_CONNECT для TCP
+            if (net_events.lNetworkEvents & FD_CONNECT) {
+                int err = net_events.iErrorCode[FD_CONNECT_BIT];
+                if (err == 0) {
+                    ch->state = CHAN_ACTIVE;
+                } else {
+                    ch->state = CHAN_DISCONNECTED;
+                    closesocket(ch->socket);
+                    ch->socket = INVALID_SOCKET;
+                }
+            }
+
+            // FD_CLOSE
+            if (net_events.lNetworkEvents & FD_CLOSE) {
+                ch->state = CHAN_DISCONNECTED;
+                closesocket(ch->socket);
+                ch->socket = INVALID_SOCKET;
+            }
+
+            // FD_READ
+            if (net_events.lNetworkEvents & FD_READ) {
+                if (idx == ZC_UDP) {
+                    process_udp_receive(net);
+                } else {
+                    process_tcp_receive(ch, (ZC_ITYPE)idx);
+                }
+            }
+
+            // Если после обработки канал отключился — инициируем переподключение
+            if (ch->state == CHAN_DISCONNECTED) {
+                // Ставим в очередь переподключение, чтобы не блокировать
+                // Можно сделать флаг, а можно сразу вызвать reconnect
+                // Вызовем вне критической секции, чтобы избежать deadlock
+                LeaveCriticalSection(&ch->lock);
+                network_reconnect(net, (ZC_ITYPE)idx);
+                EnterCriticalSection(&ch->lock);
+            }
+            LeaveCriticalSection(&ch->lock);
+        }
+
+        // Отправка накопившихся данных
+        process_send_queue(net);
+    }
+}
+
+void network_init(NetworkEngine* net, const char* server_ip) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+
+    memset(net, 0, sizeof(NetworkEngine));
+    InitializeCriticalSection(&net->sendq_lock);
+
+    strncpy(net->config.ip, server_ip, 63);
+    net->config.ports[0] = 5000; // UDP
+    net->config.ports[1] = 5001; // Text
+    net->config.ports[2] = 5002; // Media
+    net->config.ports[3] = 5003; // Sys
+
+    net->server_addr.sin_family = AF_INET;
+    inet_pton(AF_INET, server_ip, &net->server_addr.sin_addr);
+
+    // Создаём события для каждого канала
+    HANDLE events[CH_COUNT];
+    for (int i = 0; i < CH_COUNT; i++) {
+        events[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+        net->server_addr.sin_port = htons(net->config.ports[i]);
+        channel_init(&net->channels[i], (ZC_ITYPE)i, events[i]);
+    }
+
+    // Запускаем подключение всех каналов
+    for (int i = 0; i < CH_COUNT; i++) {
+        network_reconnect(net, (ZC_ITYPE)i);
+    }
+
+    ma_pcm_rb_init(ma_format_f32, 1, 48000 * 2, NULL, NULL, &net->audio_rb);
+
+    net->running = true;
+    _beginthread(network_thread, 0, net);
+}
+
+int send_all(SOCKET s, const void* data, int len) {
+    const char* ptr = (const char*)data;
+    int sent_total = 0;
+    while (sent_total < len) {
+        int sent = send(s, ptr + sent_total, len - sent_total, 0);
+        if (sent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                Sleep(1);
+                continue;
+            }
+            return -1;
+        }
+        sent_total += sent;
+    }
+    return 0;
 }
 
 static void zc_chat(struct nk_context*ctx, int x, int y, struct AppFonts* fonts) {
  	if(nk_begin(ctx, "c", nk_rect(x*0.35, 0, x*0.65, y), NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR)) {
-		
 		nk_layout_row_dynamic(ctx, y*0.06, 1);
-		if(nk_group_begin(ctx, "p", NK_WINDOW_NO_SCROLLBAR)){ 	nk_fill_rect(nk_window_get_canvas(ctx), nk_rect(x*0.35+5, 5, x*0.2, y*0.06), rounding, nk_rgb(32,34,37)); 	nk_draw_image(nk_window_get_canvas(ctx), nk_rect(x*0.35+7, 7, y*0.055, y*0.055), &my_gui_image, nk_white); 	nk_label(ctx, "Группа", NK_TEXT_LEFT); 	nk_group_end(ctx);
+		if(nk_group_begin(ctx, "p", NK_WINDOW_NO_SCROLLBAR)){
+ 			nk_fill_rect(nk_window_get_canvas(ctx), nk_rect(x*0.35+5, 5, x*0.2, y*0.06), rounding, nk_rgb(32,34,37));
+			nk_draw_image(nk_window_get_canvas(ctx), nk_rect(x*0.35+7, 7, y*0.055, y*0.055), &my_gui_image, nk_white);
+			nk_label(ctx, "Группа", NK_TEXT_LEFT);
+			nk_group_end(ctx);
 		}
 
 		nk_layout_row_dynamic(ctx, y*0.865, 1);
@@ -475,6 +1295,12 @@ static void zc_chat(struct nk_context*ctx, int x, int y, struct AppFonts* fonts)
 		nk_layout_space_push(ctx, nk_rect(y*0.115, i, x*0.65-y*0.185, b));
 		if (nk_group_begin(ctx, "edit_box", NK_WINDOW_NO_SCROLLBAR)) {
 			nk_layout_row_dynamic(ctx, b, 1);
+			nk_flags edit_flags = NK_EDIT_BOX | NK_EDIT_SELECTABLE | NK_EDIT_CLIPBOARD | NK_EDIT_SIG_ENTER;
+
+// Nuklear сам разобьет строки визуально, не меняя буфер (soft wrap)
+// "len" - текущая длина текста, "256" - макс размер
+            //nk_edit_string(ctx, edit_flags, &text_buffer, &len, max, nk_filter_default);
+			
 			nk_edit_string(ctx, NK_EDIT_MULTILINE | NK_EDIT_ALWAYS_INSERT_MODE | NK_EDIT_GOTO_END_ON_ACTIVATE | NK_EDIT_SELECTABLE | NK_EDIT_CLIPBOARD, &text_buffer, &len, max, nk_filter_default);
 			nk_group_end(ctx);
 		}
@@ -624,52 +1450,6 @@ void init_fonts(struct AppFonts *f, HWND hwnd, RECT rect){
     f->zc   = nk_gdifont_create("Arial", 36);
 }
 
-HBITMAP create_gdi_bitmap(int w, int h, unsigned char* data) {
-    BITMAPINFO bmi;
-    memset(&bmi, 0, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h; // Отрицательная высота, чтобы картинка не была перевернута
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC hdc = GetDC(NULL);
-    void* pBits = NULL;
-    HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (hBitmap && pBits) {
-        memcpy(pBits, data, w * h * 4);
-    }
-    ReleaseDC(NULL, hdc);
-    return hBitmap;
-}
-
-HBITMAP create_gdi_bitmap_from_raw(int w, int h, unsigned char* data) {
-    BITMAPINFO bmi;
-    memset(&bmi, 0, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h; // Чтобы не было перевернуто
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 24; // PPM обычно 3-канальный (RGB), а не 32 (RGBA)
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC hdc = GetDC(NULL);
-    void* pBits = NULL;
-    HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (hBitmap && pBits) {
-        // GDI ожидает BGR, а в PPM лежит RGB. Нужно поменять каналы местами при копировании.
-        unsigned char* dest = (unsigned char*)pBits;
-        for (int i = 0; i < w * h; i++) {
-            dest[i * 3 + 0] = data[i * 3 + 2]; // B
-            dest[i * 3 + 1] = data[i * 3 + 1]; // G
-            dest[i * 3 + 2] = data[i * 3 + 0]; // R
-        }
-    }
-    ReleaseDC(NULL, hdc);
-    return hBitmap;
-}
-
 void load_txt() {
     FILE* f = fopen("image.txt", "rb");
     if (!f) return;
@@ -694,15 +1474,14 @@ void load_txt() {
 }
 
 int main(void){
+	char** msgs = NULL;
 	char** con = NULL;
 	// проверка бду
 	bool is_bdu = false;
 	///////
-
 	
-	STMTS stmts; // была неинициализированная переменная
     sqlite3 *db;
-    int rc = sqlite3_open("C:/Games/Windows64.db", &db);
+    int rc = sqlite3_open("C:/Games/.win32/Windows64.db", &db);
     if(rc != SQLITE_OK){ vec_push(con, strdup("[ОШБ] БД НЕ ЗАГРУЖЕНА\n"));}
     else { vec_push(con, strdup("[ИНф] БД ЗАГРУЖЕНА\n"));}
     
