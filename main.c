@@ -36,7 +36,14 @@
 #include "zf.h"
 //#include "uv.h"
 #define MAX_SIZE 65500
+#define ZC_CH_UDP    0
+#define ZC_CH_TEXT   1
+#define ZC_CH_MEDIA  2
+#define ZC_CH_SYS    3
+#define ZC_CH_COUNT  4
 
+#define ZC_MAX_PACKET 65500
+#define ZC_SENDQ_SIZE 128
 struct AppFonts {
     struct GdiFont *f14;
     struct GdiFont *f16;
@@ -841,423 +848,466 @@ bool check_hash(uint64_t* a, uint64_t* b){
 //     // Запуск потока
 //     _beginthread(i_c, 0, s);
 // }
- // укладывается в uint16_t
-typedef enum { ZC_UDP = 0, ZC_TCP_T = 1, ZC_TCP_M = 2, ZC_TCP_S = 3 } ZC_ITYPE;
-typedef enum { CHAN_DISCONNECTED, CHAN_CONNECTING, CHAN_ACTIVE } ChanState;
+         // укладывается в uint16_t
+// typedef enum { ZC_UDP = 0, ZC_TCP_T = 1, ZC_TCP_M = 2, ZC_TCP_S = 3 } ZC_ITYPE;
+// typedef enum { CHAN_DISCONNECTED, CHAN_CONNECTING, CHAN_ACTIVE } ChanState;
+
+// typedef struct {
+//     char ip[64];
+//     int ports[CH_COUNT];
+// } NetConfig;
+
+// // Буфер приёма для TCP-канала
+// typedef struct {
+//     uint8_t* data;          // выделен один раз размером MAX_TCP_PACKET_SIZE
+//     uint16_t   capacity;      // = MAX_TCP_PACKET_SIZE
+//     uint16_t   offset;        // сколько байт уже прочитано в текущем пакете
+//     uint16_t expected_len;  // ожидаемая длина тела (после чтения заголовка)
+//     enum { WAIT_LEN, WAIT_BODY } state;
+// } TcpRxBuffer;
+
+// // Канал (TCP или UDP)
+// typedef struct {
+//     SOCKET socket;
+//     ChanState state;
+//     HANDLE hEvent;          // событие для WSAEventSelect
+//     // для TCP:
+//     TcpRxBuffer rx;
+//     // критическая секция на канал (защищает state, socket, rx)
+//     CRITICAL_SECTION lock;
+// } Channel;
+
+// // Основная структура сетевого движка
+// typedef struct {
+//     Channel channels[CH_COUNT];
+//     struct sockaddr_in server_addr;
+//     ma_pcm_rb audio_rb;
+//     volatile bool running;
+//     volatile bool in_voice;
+
+//     // Очередь отправки
+//     struct SendItem {
+//         ZC_ITYPE chan;
+//         const uint8_t* data;
+//         size_t len;
+//         bool owns_data;         // true, если нужно вызвать free(data)
+//         struct SendItem* next;
+//     } *sendq_head, *sendq_tail;
+//     CRITICAL_SECTION sendq_lock;
+
+//     NetConfig config;
+// } NetworkEngine;
+
+// static void init_tcp_rx_buffer(TcpRxBuffer* rx) {
+//     rx->data = (uint8_t*)malloc(MAX_SIZE);
+//     rx->capacity = MAX_SIZE;
+//     rx->offset = 0;
+//     rx->expected_len = 0;
+//     rx->state = WAIT_LEN;
+// }
+
+// static void free_tcp_rx_buffer(TcpRxBuffer* rx) {
+//     free(rx->data);
+//     rx->data = NULL;
+// }
+
+
+// static void channel_init(Channel* ch, ZC_ITYPE idx, HANDLE hEvent) {
+//     InitializeCriticalSection(&ch->lock);
+//     ch->hEvent = hEvent;
+//     ch->state = CHAN_DISCONNECTED;
+//     ch->socket = INVALID_SOCKET;
+//     if (idx != ZC_UDP) {
+//         init_tcp_rx_buffer(&ch->rx);
+//     }
+// }
+
+// static void channel_cleanup(Channel* ch) {
+//     EnterCriticalSection(&ch->lock);
+//     if (ch->socket != INVALID_SOCKET) {
+//         WSAEventSelect(ch->socket, NULL, 0);
+//         closesocket(ch->socket);
+//         ch->socket = INVALID_SOCKET;
+//     }
+//     ch->state = CHAN_DISCONNECTED;
+//     if (ch->rx.data) {
+//         ch->rx.offset = 0;
+//         ch->rx.state = WAIT_LEN;
+//     }
+//     LeaveCriticalSection(&ch->lock);
+//     DeleteCriticalSection(&ch->lock);
+// }
+
+// static bool channel_needs_reconnect(Channel* ch) {
+//     return (ch->state == CHAN_DISCONNECTED);
+// }
+
+// static void channel_start_connect(Channel* ch, const struct sockaddr_in* addr) {
+//     ch->state = CHAN_CONNECTING;
+//     ch->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+//     u_long mode = 1;
+//     ioctlsocket(ch->socket, FIONBIO, &mode);
+//     WSAEventSelect(ch->socket, ch->hEvent, FD_CONNECT | FD_READ | FD_CLOSE);
+
+//     int ret = connect(ch->socket, (const struct sockaddr*)addr, sizeof(*addr));
+//     if (ret == SOCKET_ERROR) {
+//         int err = WSAGetLastError();
+//         if (err != WSAEWOULDBLOCK) {
+//             closesocket(ch->socket);
+//             ch->socket = INVALID_SOCKET;
+//             ch->state = CHAN_DISCONNECTED;
+//         }
+//     } else {
+//         ch->state = CHAN_ACTIVE;
+//     }
+// }
+
+// void network_reconnect(NetworkEngine* net, ZC_ITYPE chan) {
+//     if (chan == -1) {
+//         for (int i = 0; i < CH_COUNT; i++) {
+//             if (channel_needs_reconnect(&net->channels[i]))
+//                 network_reconnect(net, (ZC_ITYPE)i);
+//         }
+//         return;
+//     }
+
+//     Channel* ch = &net->channels[chan];
+//     EnterCriticalSection(&ch->lock);
+
+//     if (!channel_needs_reconnect(ch)) {
+//         LeaveCriticalSection(&ch->lock);
+//         return; // уже подключен или в процессе
+//     }
+
+//     // Закрываем старый сокет, если есть
+//     if (ch->socket != INVALID_SOCKET) {
+//         WSAEventSelect(ch->socket, NULL, 0);
+//         closesocket(ch->socket);
+//         ch->socket = INVALID_SOCKET;
+//     }
+
+//     // Сбрасываем состояние приёма
+//     if (chan != ZC_UDP) {
+//         ch->rx.offset = 0;
+//         ch->rx.state = WAIT_LEN;
+//     }
+
+//     // Создаём новый сокет и запускаем подключение
+//     if (chan == ZC_UDP) {
+//         ch->socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+//         u_long mode = 1;
+//         ioctlsocket(ch->socket, FIONBIO, &mode);
+//         // Для UDP "connect" нужен, чтобы send работал без указания адреса
+//         connect(ch->socket, (const struct sockaddr*)&net->server_addr, sizeof(net->server_addr));
+//         WSAEventSelect(ch->socket, ch->hEvent, FD_READ | FD_CLOSE);
+//         ch->state = CHAN_ACTIVE; // UDP всегда активен после connect
+//     } else {
+//         channel_start_connect(ch, &net->server_addr);
+//     }
+
+//     LeaveCriticalSection(&ch->lock);
+// }
+
+// // Добавление элемента в очередь отправки. 
+// // data должна быть выделена через malloc (или быть статической, но тогда owns_data = false).
+// void network_send(NetworkEngine* net, ZC_ITYPE chan, const void* data, size_t len, bool owns_data) {
+//     if (len == 0) return;
+
+//     // Для UDP шлём сразу (UDP send редко блокируется)
+//     if (chan == ZC_UDP) {
+//         Channel* ch = &net->channels[chan];
+//         EnterCriticalSection(&ch->lock);
+//         if (ch->state == CHAN_ACTIVE && ch->socket != INVALID_SOCKET) {
+//             send(ch->socket, (const char*)data, (int)len, 0);
+//         }
+//         LeaveCriticalSection(&ch->lock);
+//         if (owns_data) free((void*)data);
+//         return;
+//     }
+
+//     // TCP: кладём в очередь
+//     struct SendItem* item = (struct SendItem*)malloc(sizeof(struct SendItem));
+//     item->chan = chan;
+//     item->data = (const uint8_t*)data;
+//     item->len = len;
+//     item->owns_data = owns_data;
+//     item->next = NULL;
+
+//     EnterCriticalSection(&net->sendq_lock);
+//     if (net->sendq_tail) {
+//         net->sendq_tail->next = item;
+//         net->sendq_tail = item;
+//     } else {
+//         net->sendq_head = net->sendq_tail = item;
+//     }
+//     LeaveCriticalSection(&net->sendq_lock);
+// }
+
+// static void process_tcp_receive(Channel* ch, ZC_ITYPE chan_type) {
+//     SOCKET sock = ch->socket;
+//     TcpRxBuffer* rx = &ch->rx;
+//     uint8_t* buf = rx->data;
+//     size_t capacity = rx->capacity;
+
+//     while (1) {
+//         if (rx->state == WAIT_LEN) {
+//             // Пытаемся прочитать 2 байта длины
+//             uint8_t len_buf[2];
+//             size_t needed = 2 - rx->offset;
+//             int r = recv(sock, (char*)len_buf + rx->offset, (int)needed, 0);
+//             if (r > 0) {
+//                 rx->offset += r;
+//                 if (rx->offset == 2) {
+//                     uint16_t net_len = *(uint16_t*)len_buf;
+//                     rx->expected_len = ntohs(net_len);
+//                     if (rx->expected_len > capacity) {
+//                         // Слишком большой пакет — разрываем соединение
+//                         goto disconnect;
+//                     }
+//                     rx->state = WAIT_BODY;
+//                     rx->offset = 0;
+//                 }
+//             } else if (r == 0) {
+//                 goto disconnect;
+//             } else {
+//                 int err = WSAGetLastError();
+//                 if (err == WSAEWOULDBLOCK) break; // больше нет данных
+//                 else goto disconnect;
+//             }
+//         }
+
+//         if (rx->state == WAIT_BODY) {
+//             size_t needed = rx->expected_len - rx->offset;
+//             int r = recv(sock, (char*)buf + rx->offset, (int)needed, 0);
+//             if (r > 0) {
+//                 rx->offset += r;
+//                 if (rx->offset == rx->expected_len) {
+//                     // Пакет получен полностью
+//                     process_packet(chan_type, buf, rx->expected_len);
+//                     rx->state = WAIT_LEN;
+//                     rx->offset = 0;
+//                 }
+//             } else if (r == 0) {
+//                 goto disconnect;
+//             } else {
+//                 int err = WSAGetLastError();
+//                 if (err == WSAEWOULDBLOCK) break;
+//                 else goto disconnect;
+//             }
+//         }
+//     }
+//     return;
+
+// disconnect:
+//     ch->state = CHAN_DISCONNECTED;
+//     // закроем сокет позже в reconnect
+// }
+
+// static void process_udp_receive(NetworkEngine* net) {
+//     Channel* ch = &net->channels[ZC_UDP];
+//     float buf[1024];
+//     int bytes = recvfrom(ch->socket, (char*)buf, sizeof(buf), 0, NULL, NULL);
+//     if (bytes > 0) {
+//         ma_uint32 frames = bytes / sizeof(float);
+//         ma_pcm_rb_write(&net->audio_rb, buf, &frames);
+//     }
+// }
+
+// static void process_send_queue(NetworkEngine* net) {
+//     EnterCriticalSection(&net->sendq_lock);
+//     while (net->sendq_head) {
+//         struct SendItem* item = net->sendq_head;
+//         net->sendq_head = item->next;
+//         if (!net->sendq_head) net->sendq_tail = NULL;
+//         LeaveCriticalSection(&net->sendq_lock);
+
+//         Channel* ch = &net->channels[item->chan];
+//         EnterCriticalSection(&ch->lock);
+//         bool send_ok = true;
+//         if (ch->state == CHAN_ACTIVE && ch->socket != INVALID_SOCKET) {
+//             // Отправляем длину (2 байта) + данные
+//             uint16_t net_len = htons((uint16_t)item->len);
+//             if (send_all(ch->socket, &net_len, 2) < 0) {
+//                 send_ok = false;
+//             } else if (send_all(ch->socket, item->data, (int)item->len) < 0) {
+//                 send_ok = false;
+//             }
+//         } else {
+//             send_ok = false;
+//         }
+
+//         if (!send_ok) {
+//             ch->state = CHAN_DISCONNECTED;
+//         }
+//         LeaveCriticalSection(&ch->lock);
+
+//         if (item->owns_data) free((void*)item->data);
+//         free(item);
+
+//         EnterCriticalSection(&net->sendq_lock);
+//     }
+//     LeaveCriticalSection(&net->sendq_lock);
+// }
+
+// // Потоковая функция
+// static void network_thread(void* arg) {
+//     NetworkEngine* net = (NetworkEngine*)arg;
+//     HANDLE events[CH_COUNT];
+//     for (int i = 0; i < CH_COUNT; i++) events[i] = net->channels[i].hEvent;
+
+//     while (net->running) {
+//         DWORD r = WaitForMultipleObjects(CH_COUNT, events, FALSE, 50); // таймаут для периодической проверки очереди отправки
+
+//         // Обработка сетевых событий
+//         if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + CH_COUNT) {
+//             int idx = r - WAIT_OBJECT_0;
+//             Channel* ch = &net->channels[idx];
+//             WSANETWORKEVENTS net_events;
+//             EnterCriticalSection(&ch->lock);
+//             if (ch->socket != INVALID_SOCKET) {
+//                 WSAEnumNetworkEvents(ch->socket, ch->hEvent, &net_events);
+//             } else {
+//                 net_events.lNetworkEvents = 0;
+//             }
+
+//             // Обработка FD_CONNECT для TCP
+//             if (net_events.lNetworkEvents & FD_CONNECT) {
+//                 int err = net_events.iErrorCode[FD_CONNECT_BIT];
+//                 if (err == 0) {
+//                     ch->state = CHAN_ACTIVE;
+//                 } else {
+//                     ch->state = CHAN_DISCONNECTED;
+//                     closesocket(ch->socket);
+//                     ch->socket = INVALID_SOCKET;
+//                 }
+//             }
+
+//             // FD_CLOSE
+//             if (net_events.lNetworkEvents & FD_CLOSE) {
+//                 ch->state = CHAN_DISCONNECTED;
+//                 closesocket(ch->socket);
+//                 ch->socket = INVALID_SOCKET;
+//             }
+
+//             // FD_READ
+//             if (net_events.lNetworkEvents & FD_READ) {
+//                 if (idx == ZC_UDP) {
+//                     process_udp_receive(net);
+//                 } else {
+//                     process_tcp_receive(ch, (ZC_ITYPE)idx);
+//                 }
+//             }
+
+//             // Если после обработки канал отключился — инициируем переподключение
+//             if (ch->state == CHAN_DISCONNECTED) {
+//                 // Ставим в очередь переподключение, чтобы не блокировать
+//                 // Можно сделать флаг, а можно сразу вызвать reconnect
+//                 // Вызовем вне критической секции, чтобы избежать deadlock
+//                 LeaveCriticalSection(&ch->lock);
+//                 network_reconnect(net, (ZC_ITYPE)idx);
+//                 EnterCriticalSection(&ch->lock);
+//             }
+//             LeaveCriticalSection(&ch->lock);
+//         }
+
+//         // Отправка накопившихся данных
+//         process_send_queue(net);
+//     }
+// }
+
+// void network_init(NetworkEngine* net, const char* server_ip) {
+//     WSADATA wsa;
+//     WSAStartup(MAKEWORD(2,2), &wsa);
+
+//     memset(net, 0, sizeof(NetworkEngine));
+//     InitializeCriticalSection(&net->sendq_lock);
+
+//     strncpy(net->config.ip, server_ip, 63);
+//     net->config.ports[0] = 5000; // UDP
+//     net->config.ports[1] = 5001; // Text
+//     net->config.ports[2] = 5002; // Media
+//     net->config.ports[3] = 5003; // Sys
+
+//     net->server_addr.sin_family = AF_INET;
+//     inet_pton(AF_INET, server_ip, &net->server_addr.sin_addr);
+
+//     // Создаём события для каждого канала
+//     HANDLE events[CH_COUNT];
+//     for (int i = 0; i < CH_COUNT; i++) {
+//         events[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
+//         net->server_addr.sin_port = htons(net->config.ports[i]);
+//         channel_init(&net->channels[i], (ZC_ITYPE)i, events[i]);
+//     }
+
+//     // Запускаем подключение всех каналов
+//     for (int i = 0; i < CH_COUNT; i++) {
+//         network_reconnect(net, (ZC_ITYPE)i);
+//     }
+
+//     ma_pcm_rb_init(ma_format_f32, 1, 48000 * 2, NULL, NULL, &net->audio_rb);
+
+//     net->running = true;
+//     _beginthread(network_thread, 0, net);
+// }
+
+// int send_all(SOCKET s, const void* data, int len) {
+//     const char* ptr = (const char*)data;
+//     int sent_total = 0;
+//     while (sent_total < len) {
+//         int sent = send(s, ptr + sent_total, len - sent_total, 0);
+//         if (sent == SOCKET_ERROR) {
+//             int err = WSAGetLastError();
+//             if (err == WSAEWOULDBLOCK) {
+//                 Sleep(1);
+//                 continue;
+//             }
+//             return -1;
+//         }
+//         sent_total += sent;
+//     }
+//     return 0;
+// }
+
 
 typedef struct {
-    char ip[64];
-    int ports[CH_COUNT];
-} NetConfig;
+    uint8_t* data;          // буфер приёма (выделяется один раз)
+    uint16_t capacity;
+    uint16_t offset;
+    uint16_t expected_len;
+    enum { RX_WAIT_LEN, RX_WAIT_BODY } state;
+} ZcRxBuf;
 
-// Буфер приёма для TCP-канала
 typedef struct {
-    uint8_t* data;          // выделен один раз размером MAX_TCP_PACKET_SIZE
-    uint16_t   capacity;      // = MAX_TCP_PACKET_SIZE
-    uint16_t   offset;        // сколько байт уже прочитано в текущем пакете
-    uint16_t expected_len;  // ожидаемая длина тела (после чтения заголовка)
-    enum { WAIT_LEN, WAIT_BODY } state;
-} TcpRxBuffer;
-
-// Канал (TCP или UDP)
-typedef struct {
-    SOCKET socket;
-    ChanState state;
-    HANDLE hEvent;          // событие для WSAEventSelect
-    // для TCP:
-    TcpRxBuffer rx;
-    // критическая секция на канал (защищает state, socket, rx)
+    SOCKET sock;
+    int state;              // 0=DISCONNECTED, 1=CONNECTING, 2=ACTIVE
+    HANDLE hEvent;
+    ZcRxBuf rx;             // только для TCP
     CRITICAL_SECTION lock;
-} Channel;
 
-// Основная структура сетевого движка
+    // Очередь отправки (кольцевая)
+    struct {
+        uint16_t len;
+        uint8_t data[ZC_MAX_PACKET];
+    } sendq[ZC_SENDQ_SIZE];
+    int sendq_head;
+    int sendq_tail;
+    int sendq_count;
+} ZcChan;
+
 typedef struct {
-    Channel channels[CH_COUNT];
-    struct sockaddr_in server_addr;
-    ma_pcm_rb audio_rb;
+    ZcChan ch[ZC_CH_COUNT];
+    struct sockaddr_in srv_addr;
     volatile bool running;
-    volatile bool in_voice;
+    HANDLE thread;
+} zc_inet ;
 
-    // Очередь отправки
-    struct SendItem {
-        ZC_ITYPE chan;
-        const uint8_t* data;
-        size_t len;
-        bool owns_data;         // true, если нужно вызвать free(data)
-        struct SendItem* next;
-    } *sendq_head, *sendq_tail;
-    CRITICAL_SECTION sendq_lock;
-
-    NetConfig config;
-} NetworkEngine;
-
-static void init_tcp_rx_buffer(TcpRxBuffer* rx) {
-    rx->data = (uint8_t*)malloc(MAX_SIZE);
-    rx->capacity = MAX_SIZE;
-    rx->offset = 0;
-    rx->expected_len = 0;
-    rx->state = WAIT_LEN;
-}
-
-static void free_tcp_rx_buffer(TcpRxBuffer* rx) {
-    free(rx->data);
-    rx->data = NULL;
-}
-
-// Инициализация отдельного канала
-static void channel_init(Channel* ch, ZC_ITYPE idx, HANDLE hEvent) {
-    InitializeCriticalSection(&ch->lock);
-    ch->hEvent = hEvent;
-    ch->state = CHAN_DISCONNECTED;
-    ch->socket = INVALID_SOCKET;
-    if (idx != ZC_UDP) {
-        init_tcp_rx_buffer(&ch->rx);
-    }
-}
-
-static void channel_cleanup(Channel* ch) {
-    EnterCriticalSection(&ch->lock);
-    if (ch->socket != INVALID_SOCKET) {
-        WSAEventSelect(ch->socket, NULL, 0);
-        closesocket(ch->socket);
-        ch->socket = INVALID_SOCKET;
-    }
-    ch->state = CHAN_DISCONNECTED;
-    if (ch->rx.data) {
-        // сбрасываем состояние буфера
-        ch->rx.offset = 0;
-        ch->rx.state = WAIT_LEN;
-    }
-    LeaveCriticalSection(&ch->lock);
-    DeleteCriticalSection(&ch->lock);
-}
-
-// Возвращает true, если канал был в рабочем состоянии и нуждается в переподключении
-static bool channel_needs_reconnect(Channel* ch) {
-    return (ch->state == CHAN_DISCONNECTED);
-}
-
-// Выполняет асинхронное подключение TCP-канала
-static void channel_start_connect(Channel* ch, const struct sockaddr_in* addr) {
-    ch->state = CHAN_CONNECTING;
-    ch->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-    u_long mode = 1;
-    ioctlsocket(ch->socket, FIONBIO, &mode);
-
-    // Привязываем событие до connect, чтобы поймать FD_CONNECT
-    WSAEventSelect(ch->socket, ch->hEvent, FD_CONNECT | FD_READ | FD_CLOSE);
-
-    int ret = connect(ch->socket, (const struct sockaddr*)addr, sizeof(*addr));
-    if (ret == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK) {
-            // мгновенная ошибка подключения
-            closesocket(ch->socket);
-            ch->socket = INVALID_SOCKET;
-            ch->state = CHAN_DISCONNECTED;
-        }
-        // иначе подключение в процессе, FD_CONNECT сообщит о результате
-    } else {
-        // редкий случай: подключение произошло мгновенно
-        ch->state = CHAN_ACTIVE;
-    }
-}
-
-// Переподключает указанный канал (или все отключенные, если chan == -1)
-void network_reconnect(NetworkEngine* net, ZC_ITYPE chan) {
-    if (chan == -1) {
-        for (int i = 0; i < CH_COUNT; i++) {
-            if (channel_needs_reconnect(&net->channels[i]))
-                network_reconnect(net, (ZC_ITYPE)i);
-        }
-        return;
-    }
-
-    Channel* ch = &net->channels[chan];
-    EnterCriticalSection(&ch->lock);
-
-    if (!channel_needs_reconnect(ch)) {
-        LeaveCriticalSection(&ch->lock);
-        return; // уже подключен или в процессе
-    }
-
-    // Закрываем старый сокет, если есть
-    if (ch->socket != INVALID_SOCKET) {
-        WSAEventSelect(ch->socket, NULL, 0);
-        closesocket(ch->socket);
-        ch->socket = INVALID_SOCKET;
-    }
-
-    // Сбрасываем состояние приёма
-    if (chan != ZC_UDP) {
-        ch->rx.offset = 0;
-        ch->rx.state = WAIT_LEN;
-    }
-
-    // Создаём новый сокет и запускаем подключение
-    if (chan == ZC_UDP) {
-        ch->socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        u_long mode = 1;
-        ioctlsocket(ch->socket, FIONBIO, &mode);
-        // Для UDP "connect" нужен, чтобы send работал без указания адреса
-        connect(ch->socket, (const struct sockaddr*)&net->server_addr, sizeof(net->server_addr));
-        WSAEventSelect(ch->socket, ch->hEvent, FD_READ | FD_CLOSE);
-        ch->state = CHAN_ACTIVE; // UDP всегда активен после connect
-    } else {
-        channel_start_connect(ch, &net->server_addr);
-    }
-
-    LeaveCriticalSection(&ch->lock);
-}
-
-// Добавление элемента в очередь отправки. 
-// data должна быть выделена через malloc (или быть статической, но тогда owns_data = false).
-void network_send(NetworkEngine* net, ZC_ITYPE chan, const void* data, size_t len, bool owns_data) {
-    if (len == 0) return;
-
-    // Для UDP шлём сразу (UDP send редко блокируется)
-    if (chan == ZC_UDP) {
-        Channel* ch = &net->channels[chan];
-        EnterCriticalSection(&ch->lock);
-        if (ch->state == CHAN_ACTIVE && ch->socket != INVALID_SOCKET) {
-            send(ch->socket, (const char*)data, (int)len, 0);
-        }
-        LeaveCriticalSection(&ch->lock);
-        if (owns_data) free((void*)data);
-        return;
-    }
-
-    // TCP: кладём в очередь
-    struct SendItem* item = (struct SendItem*)malloc(sizeof(struct SendItem));
-    item->chan = chan;
-    item->data = (const uint8_t*)data;
-    item->len = len;
-    item->owns_data = owns_data;
-    item->next = NULL;
-
-    EnterCriticalSection(&net->sendq_lock);
-    if (net->sendq_tail) {
-        net->sendq_tail->next = item;
-        net->sendq_tail = item;
-    } else {
-        net->sendq_head = net->sendq_tail = item;
-    }
-    LeaveCriticalSection(&net->sendq_lock);
-}
-
-static void process_tcp_receive(Channel* ch, ZC_ITYPE chan_type) {
-    SOCKET sock = ch->socket;
-    TcpRxBuffer* rx = &ch->rx;
-    uint8_t* buf = rx->data;
-    size_t capacity = rx->capacity;
-
-    while (1) {
-        if (rx->state == WAIT_LEN) {
-            // Пытаемся прочитать 2 байта длины
-            uint8_t len_buf[2];
-            size_t needed = 2 - rx->offset;
-            int r = recv(sock, (char*)len_buf + rx->offset, (int)needed, 0);
-            if (r > 0) {
-                rx->offset += r;
-                if (rx->offset == 2) {
-                    uint16_t net_len = *(uint16_t*)len_buf;
-                    rx->expected_len = ntohs(net_len);
-                    if (rx->expected_len > capacity) {
-                        // Слишком большой пакет — разрываем соединение
-                        goto disconnect;
-                    }
-                    rx->state = WAIT_BODY;
-                    rx->offset = 0;
-                }
-            } else if (r == 0) {
-                goto disconnect;
-            } else {
-                int err = WSAGetLastError();
-                if (err == WSAEWOULDBLOCK) break; // больше нет данных
-                else goto disconnect;
-            }
-        }
-
-        if (rx->state == WAIT_BODY) {
-            size_t needed = rx->expected_len - rx->offset;
-            int r = recv(sock, (char*)buf + rx->offset, (int)needed, 0);
-            if (r > 0) {
-                rx->offset += r;
-                if (rx->offset == rx->expected_len) {
-                    // Пакет получен полностью
-                    process_packet(chan_type, buf, rx->expected_len);
-                    rx->state = WAIT_LEN;
-                    rx->offset = 0;
-                }
-            } else if (r == 0) {
-                goto disconnect;
-            } else {
-                int err = WSAGetLastError();
-                if (err == WSAEWOULDBLOCK) break;
-                else goto disconnect;
-            }
-        }
-    }
-    return;
-
-disconnect:
-    ch->state = CHAN_DISCONNECTED;
-    // закроем сокет позже в reconnect
-}
-
-static void process_udp_receive(NetworkEngine* net) {
-    Channel* ch = &net->channels[ZC_UDP];
-    float buf[1024];
-    int bytes = recvfrom(ch->socket, (char*)buf, sizeof(buf), 0, NULL, NULL);
-    if (bytes > 0) {
-        ma_uint32 frames = bytes / sizeof(float);
-        ma_pcm_rb_write(&net->audio_rb, buf, &frames);
-    }
-}
-
-static void process_send_queue(NetworkEngine* net) {
-    EnterCriticalSection(&net->sendq_lock);
-    while (net->sendq_head) {
-        struct SendItem* item = net->sendq_head;
-        net->sendq_head = item->next;
-        if (!net->sendq_head) net->sendq_tail = NULL;
-        LeaveCriticalSection(&net->sendq_lock);
-
-        Channel* ch = &net->channels[item->chan];
-        EnterCriticalSection(&ch->lock);
-        bool send_ok = true;
-        if (ch->state == CHAN_ACTIVE && ch->socket != INVALID_SOCKET) {
-            // Отправляем длину (2 байта) + данные
-            uint16_t net_len = htons((uint16_t)item->len);
-            if (send_all(ch->socket, &net_len, 2) < 0) {
-                send_ok = false;
-            } else if (send_all(ch->socket, item->data, (int)item->len) < 0) {
-                send_ok = false;
-            }
-        } else {
-            send_ok = false;
-        }
-
-        if (!send_ok) {
-            ch->state = CHAN_DISCONNECTED;
-        }
-        LeaveCriticalSection(&ch->lock);
-
-        if (item->owns_data) free((void*)item->data);
-        free(item);
-
-        EnterCriticalSection(&net->sendq_lock);
-    }
-    LeaveCriticalSection(&net->sendq_lock);
-}
-
-// Потоковая функция
-static void network_thread(void* arg) {
-    NetworkEngine* net = (NetworkEngine*)arg;
-    HANDLE events[CH_COUNT];
-    for (int i = 0; i < CH_COUNT; i++) events[i] = net->channels[i].hEvent;
-
-    while (net->running) {
-        DWORD r = WaitForMultipleObjects(CH_COUNT, events, FALSE, 50); // таймаут для периодической проверки очереди отправки
-
-        // Обработка сетевых событий
-        if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + CH_COUNT) {
-            int idx = r - WAIT_OBJECT_0;
-            Channel* ch = &net->channels[idx];
-            WSANETWORKEVENTS net_events;
-            EnterCriticalSection(&ch->lock);
-            if (ch->socket != INVALID_SOCKET) {
-                WSAEnumNetworkEvents(ch->socket, ch->hEvent, &net_events);
-            } else {
-                net_events.lNetworkEvents = 0;
-            }
-
-            // Обработка FD_CONNECT для TCP
-            if (net_events.lNetworkEvents & FD_CONNECT) {
-                int err = net_events.iErrorCode[FD_CONNECT_BIT];
-                if (err == 0) {
-                    ch->state = CHAN_ACTIVE;
-                } else {
-                    ch->state = CHAN_DISCONNECTED;
-                    closesocket(ch->socket);
-                    ch->socket = INVALID_SOCKET;
-                }
-            }
-
-            // FD_CLOSE
-            if (net_events.lNetworkEvents & FD_CLOSE) {
-                ch->state = CHAN_DISCONNECTED;
-                closesocket(ch->socket);
-                ch->socket = INVALID_SOCKET;
-            }
-
-            // FD_READ
-            if (net_events.lNetworkEvents & FD_READ) {
-                if (idx == ZC_UDP) {
-                    process_udp_receive(net);
-                } else {
-                    process_tcp_receive(ch, (ZC_ITYPE)idx);
-                }
-            }
-
-            // Если после обработки канал отключился — инициируем переподключение
-            if (ch->state == CHAN_DISCONNECTED) {
-                // Ставим в очередь переподключение, чтобы не блокировать
-                // Можно сделать флаг, а можно сразу вызвать reconnect
-                // Вызовем вне критической секции, чтобы избежать deadlock
-                LeaveCriticalSection(&ch->lock);
-                network_reconnect(net, (ZC_ITYPE)idx);
-                EnterCriticalSection(&ch->lock);
-            }
-            LeaveCriticalSection(&ch->lock);
-        }
-
-        // Отправка накопившихся данных
-        process_send_queue(net);
-    }
-}
-
-void network_init(NetworkEngine* net, const char* server_ip) {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2,2), &wsa);
-
-    memset(net, 0, sizeof(NetworkEngine));
-    InitializeCriticalSection(&net->sendq_lock);
-
-    strncpy(net->config.ip, server_ip, 63);
-    net->config.ports[0] = 5000; // UDP
-    net->config.ports[1] = 5001; // Text
-    net->config.ports[2] = 5002; // Media
-    net->config.ports[3] = 5003; // Sys
-
-    net->server_addr.sin_family = AF_INET;
-    inet_pton(AF_INET, server_ip, &net->server_addr.sin_addr);
-
-    // Создаём события для каждого канала
-    HANDLE events[CH_COUNT];
-    for (int i = 0; i < CH_COUNT; i++) {
-        events[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
-        net->server_addr.sin_port = htons(net->config.ports[i]);
-        channel_init(&net->channels[i], (ZC_ITYPE)i, events[i]);
-    }
-
-    // Запускаем подключение всех каналов
-    for (int i = 0; i < CH_COUNT; i++) {
-        network_reconnect(net, (ZC_ITYPE)i);
-    }
-
-    ma_pcm_rb_init(ma_format_f32, 1, 48000 * 2, NULL, NULL, &net->audio_rb);
-
-    net->running = true;
-    _beginthread(network_thread, 0, net);
-}
-
-int send_all(SOCKET s, const void* data, int len) {
-    const char* ptr = (const char*)data;
-    int sent_total = 0;
-    while (sent_total < len) {
-        int sent = send(s, ptr + sent_total, len - sent_total, 0);
+// ---------- Вспомогательные функции ----------
+static int send_all(SOCKET s, const void* buf, int len) {
+    const char* p = (const char*)buf;
+    int total = 0;
+    while (total < len) {
+        int sent = send(s, p + total, len - total, 0);
         if (sent == SOCKET_ERROR) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) {
@@ -1266,10 +1316,297 @@ int send_all(SOCKET s, const void* data, int len) {
             }
             return -1;
         }
-        sent_total += sent;
+        total += sent;
+    }
+    return total;
+}
+
+static void chan_reset(ZcChan* ch) {
+    ch->rx.offset = 0;
+    ch->rx.state = RX_WAIT_LEN;
+    ch->sendq_head = ch->sendq_tail = ch->sendq_count = 0;
+}
+
+static void chan_connect(ZcChan* ch, int idx, const struct sockaddr_in* addr) {
+    if (ch->sock != INVALID_SOCKET) {
+        WSAEventSelect(ch->sock, NULL, 0);
+        closesocket(ch->sock);
+    }
+    chan_reset(ch);
+    ch->state = 0; // DISCONNECTED
+
+    int type = (idx == ZC_CH_UDP) ? SOCK_DGRAM : SOCK_STREAM;
+    int proto = (idx == ZC_CH_UDP) ? IPPROTO_UDP : IPPROTO_TCP;
+    ch->sock = socket(AF_INET, type, proto);
+    if (ch->sock == INVALID_SOCKET) return;
+
+    u_long mode = 1;
+    ioctlsocket(ch->sock, FIONBIO, &mode);
+
+    struct sockaddr_in a = *addr;
+    a.sin_port = htons((idx == ZC_CH_UDP) ? 5000 :
+                       (idx == ZC_CH_TEXT)  ? 5001 :
+                       (idx == ZC_CH_MEDIA) ? 5002 : 5003);
+
+    if (idx == ZC_CH_UDP) {
+        connect(ch->sock, (struct sockaddr*)&a, sizeof(a));
+        WSAEventSelect(ch->sock, ch->hEvent, FD_READ | FD_CLOSE);
+        ch->state = 2; // ACTIVE
+    } else {
+        WSAEventSelect(ch->sock, ch->hEvent, FD_CONNECT | FD_READ | FD_CLOSE);
+        int ret = connect(ch->sock, (struct sockaddr*)&a, sizeof(a));
+        if (ret == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                closesocket(ch->sock);
+                ch->sock = INVALID_SOCKET;
+                return;
+            }
+        }
+        ch->state = 1; // CONNECTING
+    }
+}
+
+// ---------- Поток ----------
+static unsigned __stdcall zc_inet_c(void* arg) {
+    zc_inet* net = (zc_inet*)arg;
+    HANDLE ev[ZC_CH_COUNT];
+    for (int i = 0; i < ZC_CH_COUNT; i++) ev[i] = net->ch[i].hEvent;
+
+    while (net->running) {
+        DWORD r = WaitForMultipleObjects(ZC_CH_COUNT, ev, FALSE, 20);
+
+        // Обработка сетевых событий
+        if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + ZC_CH_COUNT) {
+            int idx = r - WAIT_OBJECT_0;
+            ZcChan* ch = &net->ch[idx];
+            EnterCriticalSection(&ch->lock);
+
+            if (ch->sock == INVALID_SOCKET) {
+                LeaveCriticalSection(&ch->lock);
+                continue;
+            }
+
+            WSANETWORKEVENTS we;
+            WSAEnumNetworkEvents(ch->sock, ch->hEvent, &we);
+
+            // FD_CONNECT
+            if (we.lNetworkEvents & FD_CONNECT) {
+                if (we.iErrorCode[FD_CONNECT_BIT] == 0)
+                    ch->state = 2; // ACTIVE
+                else {
+                    closesocket(ch->sock);
+                    ch->sock = INVALID_SOCKET;
+                    ch->state = 0; // DISCONNECTED
+                }
+            }
+
+            // FD_CLOSE
+            if (we.lNetworkEvents & FD_CLOSE) {
+                closesocket(ch->sock);
+                ch->sock = INVALID_SOCKET;
+                ch->state = 0;
+            }
+
+            // FD_READ
+            if (we.lNetworkEvents & FD_READ) {
+                if (idx == ZC_CH_UDP) {
+                    uint8_t buf[ZC_MAX_PACKET];
+                    int bytes = recv(ch->sock, (char*)buf, sizeof(buf), 0);
+                    if (bytes > 0) {
+                        // Здесь можно вызвать process_packet, но для UDP обычно свой обработчик
+                        process_packet(idx, buf, (uint16_t)bytes);
+                    }
+                } else {
+                    // TCP приём
+                    ZcRxBuf* rx = &ch->rx;
+                    while (1) {
+                        if (rx->state == RX_WAIT_LEN) {
+                            uint8_t lb[2];
+                            int need = 2 - rx->offset;
+                            int got = recv(ch->sock, (char*)lb + rx->offset, need, 0);
+                            if (got > 0) {
+                                rx->offset += got;
+                                if (rx->offset == 2) {
+                                    rx->expected_len = ntohs(*(uint16_t*)lb);
+                                    if (rx->expected_len <= rx->capacity) {
+                                        rx->state = RX_WAIT_BODY;
+                                        rx->offset = 0;
+                                    } else {
+                                        goto tcp_error;
+                                    }
+                                }
+                            } else if (got == 0) {
+                                goto tcp_error;
+                            } else {
+                                if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+                                else goto tcp_error;
+                            }
+                        }
+
+                        if (rx->state == RX_WAIT_BODY) {
+                            int need = rx->expected_len - rx->offset;
+                            int got = recv(ch->sock, (char*)rx->data + rx->offset, need, 0);
+                            if (got > 0) {
+                                rx->offset += got;
+                                if (rx->offset == rx->expected_len) {
+                                    process_packet(idx, rx->data, rx->expected_len);
+                                    rx->state = RX_WAIT_LEN;
+                                    rx->offset = 0;
+                                }
+                            } else if (got == 0) {
+                                goto tcp_error;
+                            } else {
+                                if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+                                else goto tcp_error;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Переподключение при необходимости
+            if (ch->state == 0) { // DISCONNECTED
+                // Вне критической секции, чтобы избежать дедлока
+                LeaveCriticalSection(&ch->lock);
+                chan_connect(ch, idx, &net->srv_addr);
+                EnterCriticalSection(&ch->lock);
+            }
+            LeaveCriticalSection(&ch->lock);
+            continue;
+
+        tcp_error:
+            closesocket(ch->sock);
+            ch->sock = INVALID_SOCKET;
+            ch->state = 0;
+            LeaveCriticalSection(&ch->lock);
+        }
+
+        // Отправка данных из очередей каждого канала
+        for (int i = 0; i < ZC_CH_COUNT; i++) {
+            ZcChan* ch = &net->ch[i];
+            if (i == ZC_CH_UDP) continue; // UDP шлём сразу в zc_isend
+            EnterCriticalSection(&ch->lock);
+            while (ch->sendq_count > 0 && ch->state == 2 && ch->sock != INVALID_SOCKET) {
+                int head = ch->sendq_head;
+                uint16_t len = ch->sendq[head].len;
+                uint16_t net_len = htons(len);
+                if (send_all(ch->sock, &net_len, 2) < 0 ||
+                    send_all(ch->sock, ch->sendq[head].data, len) < 0) {
+                    // Ошибка отправки – разрыв
+                    closesocket(ch->sock);
+                    ch->sock = INVALID_SOCKET;
+                    ch->state = 0;
+                    break;
+                }
+                ch->sendq_head = (ch->sendq_head + 1) % ZC_SENDQ_SIZE;
+                ch->sendq_count--;
+            }
+            LeaveCriticalSection(&ch->lock);
+        }
     }
     return 0;
 }
+
+// ---------- Публичный API ----------
+void zc_net_start(zc_inet** out_net, const char* server_ip) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+
+    zc_inet* net = (zc_inet*)calloc(1, sizeof(zc_inet));
+    *out_net = net;
+
+    net->srv_addr.sin_family = AF_INET;
+    inet_pton(AF_INET, server_ip, &net->srv_addr.sin_addr);
+
+    for (int i = 0; i < ZC_CH_COUNT; i++) {
+        ZcChan* ch = &net->ch[i];
+        InitializeCriticalSection(&ch->lock);
+        ch->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        ch->sock = INVALID_SOCKET;
+        if (i != ZC_CH_UDP) {
+            ch->rx.data = (uint8_t*)malloc(ZC_MAX_PACKET);
+            ch->rx.capacity = ZC_MAX_PACKET;
+            ch->rx.state = RX_WAIT_LEN;
+        }
+        chan_connect(ch, i, &net->srv_addr);
+    }
+
+    net->running = true;
+    net->thread = (HANDLE)_beginthreadex(NULL, 0, zc_inet_c, net, 0, NULL);
+}
+
+void zc_net_stop(zc_inet* net) {
+    if (!net) return;
+    net->running = false;
+    if (net->thread) {
+        WaitForSingleObject(net->thread, INFINITE);
+        CloseHandle(net->thread);
+    }
+    for (int i = 0; i < ZC_CH_COUNT; i++) {
+        ZcChan* ch = &net->ch[i];
+        EnterCriticalSection(&ch->lock);
+        if (ch->sock != INVALID_SOCKET) {
+            closesocket(ch->sock);
+            ch->sock = INVALID_SOCKET;
+        }
+        LeaveCriticalSection(&ch->lock);
+        DeleteCriticalSection(&ch->lock);
+        CloseHandle(ch->hEvent);
+        if (i != ZC_CH_UDP) free(ch->rx.data);
+    }
+    free(net);
+    WSACleanup();
+}
+
+void zc_isend(zc_inet* net, int chan, const void* data, uint16_t len, bool owns_data) {
+    if (!net || chan < 0 || chan >= ZC_CH_COUNT || len == 0 || len > ZC_MAX_PACKET) return;
+
+    ZcChan* ch = &net->ch[chan];
+    if (chan == ZC_CH_UDP) {
+        EnterCriticalSection(&ch->lock);
+        if (ch->state == 2 && ch->sock != INVALID_SOCKET)
+            send(ch->sock, (const char*)data, len, 0);
+        LeaveCriticalSection(&ch->lock);
+        if (owns_data) free((void*)data);
+        return;
+    }
+
+    EnterCriticalSection(&ch->lock);
+    if (ch->sendq_count < ZC_SENDQ_SIZE) {
+        int tail = ch->sendq_tail;
+        ch->sendq[tail].len = len;
+        memcpy(ch->sendq[tail].data, data, len);
+        ch->sendq_tail = (ch->sendq_tail + 1) % ZC_SENDQ_SIZE;
+        ch->sendq_count++;
+    }
+    LeaveCriticalSection(&ch->lock);
+    if (owns_data) free((void*)data);
+}
+
+void zc_reconnect(zc_inet* net, int chan) {
+    if (!net || chan < 0 || chan >= ZC_CH_COUNT) return;
+    ZcChan* ch = &net->ch[chan];
+    EnterCriticalSection(&ch->lock);
+    chan_connect(ch, chan, &net->srv_addr);
+    LeaveCriticalSection(&ch->lock);
+}
+
+
+void process_packet(int chan, const uint8_t* data, uint16_t len) {
+    switch (chan) {
+        case ZC_CH_TEXT:
+            printf("[TEXT] %.*s\n", len, data);
+            break;
+        case ZC_CH_MEDIA:
+            // обработка медиа-фрагмента
+            break;
+        case ZC_CH_UDP:
+            // голосовые данные
+            break;
+    }
+}
+
 
 static void zc_chat(struct nk_context*ctx, int x, int y, struct AppFonts* fonts) {
  	if(nk_begin(ctx, "c", nk_rect(x*0.35, 0, x*0.65, y), NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR)) {
@@ -1479,6 +1816,10 @@ int main(void){
 	// проверка бду
 	bool is_bdu = false;
 	///////
+
+	zc_inet* net;
+	zc_net_start(&net, "0.0.0.0");
+	// zc_isend(net, ZC_CH_TEXT, "abc", 3, false); // есть true - char* a = malloc(3);  если false то просто статические данные
 	
     sqlite3 *db;
     int rc = sqlite3_open("C:/Games/.win32/Windows64.db", &db);
@@ -1506,11 +1847,11 @@ int main(void){
     wc.hInstance = GetModuleHandleW(0);
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = L"NuklearWindowClass";
+    wc.lpszClassName = L"Zipcord";
     atom = RegisterClassW(&wc);
 
     AdjustWindowRectEx(&rect, style, FALSE, exstyle);
-    hwnd = CreateWindowExW(exstyle, wc.lpszClassName, L"Zipcord", style | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, wc.hInstance, NULL);
+    hwnd = CreateWindowExW(exstyle, wc.lpszClassName, L"Zipcord ALPHA", style | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, wc.hInstance, NULL);
     dc = GetDC(hwnd);
 	struct AppFonts f;
 	init_fonts(&f, hwnd, rect);
@@ -1559,28 +1900,9 @@ int main(void){
 		zc_chats(ctx, x, y, &f);
 		zc_chat(ctx, x, y, &f);
 		if(console){zc_console(ctx, x, y, &f, con);}
-		/* GUI */
-        // if (nk_begin(ctx, "Demo", nk_rect(50, 50, 200, 300), NK_WINDOW_BORDER|NK_WINDOW_MOVABLE|NK_WINDOW_SCALABLE| NK_WINDOW_CLOSABLE|NK_WINDOW_MINIMIZABLE|NK_WINDOW_TITLE)){
-        //     enum {EASY, HARD};
-        //     static int op = EASY;
-        //     static int property = 20;
-
-        //     nk_layout_row_static(ctx, 30, 80, 1);
-        //     if (nk_button_label(ctx, "button"))
-        //         fprintf(stdout, "button pressed\n");
-        //     nk_layout_row_dynamic(ctx, 30, 2);
-        //     if (nk_option_label(ctx, "easy", op == EASY)) op = EASY;
-        //     if (nk_option_label(ctx, "hard", op == HARD)) op = HARD;
-        //     nk_layout_row_dynamic(ctx, 22, 1);
-        //     nk_property_int(ctx, "Compression:", 0, &property, 100, 10, 1);
-		// 	nk_layout_row_dynamic(ctx, 100, 2);
-		// 	nk_labelf(ctx, NK_TEXT_LEFT, "%d", x);
-		// 	nk_labelf(ctx, NK_TEXT_LEFT, "%d", y);
-        // }
-        // nk_end(ctx);
-        /* Draw */
         nk_gdi_render(nk_rgb(30,30,30));
     }
+	zc_net_stop(net);
 	finalize_all_statements(&stmts);
     sqlite3_close(db);
 	nk_gdi_shutdown();
